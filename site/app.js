@@ -220,10 +220,6 @@ function selectedTpSize() {
 }
 
 function updateHardwareState() {
-  const boxes = $$("input[name='hardware']");
-  const checked = boxes.filter((box) => box.checked);
-  const all = checked.length === boxes.length;
-  $("#select-all-hardware").textContent = all ? "Clear all" : "Select all";
   applyTpAvailability();
   updateSequenceLimit();
 }
@@ -1023,15 +1019,6 @@ function bindEvents() {
   for (const id of ["sequence-length", "batch-size", "context-length"]) {
     $(`#${id}`).addEventListener("input", () => scheduleCalculate());
   }
-  $("#select-all-hardware").addEventListener("click", () => {
-    const boxes = $$("input[name='hardware']");
-    const shouldCheck = !boxes.every((box) => box.checked);
-    boxes.forEach((box) => {
-      box.checked = shouldCheck;
-    });
-    updateHardwareState();
-    scheduleCalculate();
-  });
   $("#calculator-form").addEventListener("submit", (event) => {
     event.preventDefault();
     scheduleCalculate({ immediate: true });

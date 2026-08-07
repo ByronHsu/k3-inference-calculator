@@ -464,12 +464,6 @@ a {
   letter-spacing: 0.03em;
 }
 
-.hardware-toggle {
-  position: absolute;
-  top: 0;
-  right: 0;
-}
-
 .choice-grid {
   display: grid;
   gap: 6px;
