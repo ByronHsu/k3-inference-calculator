@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta
+      name="description"
+      content="A transparent, per-layer roofline calculator for Kimi-K3 inference on H200, B300, and GB300 systems."
+    />
+    <meta name="color-scheme" content="dark light" />
+    <title>K3 Inference Calculator</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./static-runtime.js" defer></script>
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#report">Skip to report</a>
+
+    <header class="site-header">
+      <a class="brand" href="#top" aria-label="K3 Inference Calculator home">
+        <span class="brand-mark" aria-hidden="true">K3</span>
+        <span>
+          <strong>Inference Calculator</strong>
+          <small>SGLang model roofline</small>
+        </span>
+      </a>
+      <div class="header-actions">
+        <span class="status-pill">
+          <span class="status-dot" aria-hidden="true"></span>
+          Analytical lower bound
+        </span>
+        <button
+          class="icon-button"
+          id="theme-toggle"
+          type="button"
+          aria-label="Switch to light theme"
+          title="Toggle color theme"
+          data-testid="theme-toggle"
+        >
+          <span class="theme-icon" aria-hidden="true">◐</span>
+        </button>
+      </div>
+    </header>
+
+    <main class="app-shell" id="top">
+      <aside class="control-rail" aria-label="Calculator inputs">
+        <form id="calculator-form" novalidate>
+          <div class="rail-heading">
+            <p class="eyebrow">Workload</p>
+            <h1>Model the K3 forward pass.</h1>
+            <p>
+              Compare K3 tensor-parallel layouts using explicit compute,
+              memory, and fabric ceilings.
+            </p>
+          </div>
+
+          <fieldset class="control-group">
+            <legend>Phase</legend>
+            <div class="segment-control" role="radiogroup" aria-label="Inference phase">
+              <label>
+                <input
+                  type="radio"
+                  name="phase"
+                  value="prefill"
+                  checked
+                  data-testid="phase-prefill"
+                />
+                <span>Prefill</span>
+              </label>
+              <label>
+                <input
+                  type="radio"
+                  name="phase"
+                  value="decode"
+                  data-testid="phase-decode"
+                />
+                <span>Decode</span>
+              </label>
+            </div>
+          </fieldset>
+
+          <div class="phase-fields" id="prefill-fields">
+            <label class="field-label" for="sequence-length">
+              Sequence length
+              <span class="unit-tag">tokens</span>
+            </label>
+            <div class="number-field">
+              <input
+                id="sequence-length"
+                type="number"
+                min="1"
+                max="16384"
+                step="1"
+                value="4096"
+                inputmode="numeric"
+                required
+                data-testid="seq-length"
+              />
+              <span>tok</span>
+            </div>
+            <p class="field-help">
+              Cold prefill, one request. Limited to one real SGLang chunk.
+            </p>
+          </div>
+
+          <div class="phase-fields" id="decode-fields" hidden>
+            <div class="two-column-fields">
+              <div>
+                <label class="field-label" for="batch-size">Batch size</label>
+                <div class="number-field">
+                  <input
+                    id="batch-size"
+                    type="number"
+                    min="1"
+                    max="4096"
+                    step="1"
+                    value="8"
+                    inputmode="numeric"
+                    data-testid="batch-size"
+                  />
+                  <span>req</span>
+                </div>
+              </div>
+              <div>
+                <label class="field-label" for="context-length">Context</label>
+                <div class="number-field">
+                  <input
+                    id="context-length"
+                    type="number"
+                    min="1"
+                    max="1048575"
+                    step="1"
+                    value="4096"
+                    inputmode="numeric"
+                    data-testid="context-length"
+                  />
+                  <span>tok</span>
+                </div>
+              </div>
+            </div>
+            <p class="field-help">
+              Context is required: MLA cache reads scale with its length.
+            </p>
+          </div>
+
+          <fieldset class="control-group choice-group hardware-group">
+            <legend>Hardware</legend>
+            <button class="text-button hardware-toggle" id="select-all-hardware" type="button">
+              Clear all
+            </button>
+            <div class="choice-grid hardware-options">
+              <label class="choice-option">
+                <input
+                  type="checkbox"
+                  name="hardware"
+                  value="h200"
+                  checked
+                  data-testid="hardware-h200"
+                />
+                <span>
+                  <strong>H200</strong>
+                  <small>Scale-out · IB 50 GB/s</small>
+                </span>
+              </label>
+              <label class="choice-option">
+                <input
+                  type="checkbox"
+                  name="hardware"
+                  value="b300"
+                  checked
+                  data-testid="hardware-b300"
+                />
+                <span>
+                  <strong>B300</strong>
+                  <small>Scale-out · IB 100 GB/s</small>
+                </span>
+              </label>
+              <label class="choice-option">
+                <input
+                  type="checkbox"
+                  name="hardware"
+                  value="gb300"
+                  checked
+                  data-testid="hardware-gb300"
+                />
+                <span>
+                  <strong>GB300</strong>
+                  <small>NVL72 fabric</small>
+                </span>
+              </label>
+            </div>
+          </fieldset>
+
+          <fieldset class="control-group choice-group tp-group">
+            <legend>Tensor parallel size</legend>
+            <div class="choice-grid tp-options">
+              <label class="choice-option compact-option">
+                <input
+                  type="radio"
+                  name="tp-size"
+                  value="8"
+                  checked
+                  data-testid="tp-size-8"
+                />
+                <span><strong>TP8</strong></span>
+              </label>
+              <label class="choice-option compact-option">
+                <input
+                  type="radio"
+                  name="tp-size"
+                  value="16"
+                  data-testid="tp-size-16"
+                />
+                <span><strong>TP16</strong></span>
+              </label>
+              <label class="choice-option compact-option">
+                <input type="radio" name="tp-size" value="32" data-testid="tp-size-32" />
+                <span><strong>TP32</strong></span>
+              </label>
+              <label class="choice-option compact-option unsupported-option">
+                <input
+                  type="radio"
+                  name="tp-size"
+                  value="64"
+                  disabled
+                  data-testid="tp-size-64"
+                />
+                <span>
+                  <strong>TP64</strong>
+                  <small>Unsupported</small>
+                </span>
+              </label>
+            </div>
+            <p class="field-help tp-help">
+              TP64 is unavailable: 96 attention heads are not divisible by 64.
+            </p>
+          </fieldset>
+
+          <div class="form-error" id="form-error" role="alert" hidden></div>
+
+          <p class="auto-calculate-note">
+            <span class="status-dot" aria-hidden="true"></span>
+            Updates automatically
+          </p>
+
+          <p class="rail-footnote">
+            No serving, scheduler, launch, or network-request overhead is included.
+          </p>
+        </form>
+      </aside>
+
+      <section class="report-shell" id="report">
+        <p
+          class="sr-only"
+          id="calculation-status"
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+        >
+          Calculator ready.
+        </p>
+        <section class="welcome-state" id="welcome-state">
+          <div class="welcome-copy">
+            <p class="eyebrow">Kimi-K3 · Text model only</p>
+            <h2>See where every microsecond goes.</h2>
+            <p>
+              A transparent roofline report for 93 decoder layers, selectable
+              tensor parallelism, and three NVIDIA systems. Adjust the inputs to compare
+              the exact model path—not a generic transformer approximation.
+            </p>
+            <div class="model-at-a-glance" aria-label="Kimi-K3 model summary">
+              <div><strong>93</strong><span>decoder layers</span></div>
+              <div><strong>69 / 24</strong><span>KDA / MLA</span></div>
+              <div><strong>896 → 16</strong><span>experts / token</span></div>
+              <div><strong>7168</strong><span>hidden width</span></div>
+            </div>
+          </div>
+          <div class="welcome-visual" aria-hidden="true">
+            <div class="visual-axis"></div>
+            <div class="visual-row visual-row-1"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <div class="visual-row visual-row-2"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <div class="visual-row visual-row-3"><i></i><i></i><i></i><i></i><i></i><i></i></div>
+            <span class="visual-label visual-label-top">Compute ceiling</span>
+            <span class="visual-label visual-label-bottom">Memory ceiling</span>
+          </div>
+        </section>
+
+        <section class="loading-state" id="loading-state" aria-label="Calculating" hidden data-testid="loading">
+          <div class="loader-orbit" aria-hidden="true"><span></span></div>
+          <div>
+            <strong>Scheduling 96 model stages…</strong>
+            <span>Counting compute, HBM traffic, and collectives per rank.</span>
+          </div>
+        </section>
+
+        <section class="error-state" id="error-state" role="alert" hidden data-testid="error">
+          <div class="error-mark" aria-hidden="true">!</div>
+          <div>
+            <strong>Couldn’t calculate this workload</strong>
+            <p id="error-message"></p>
+            <button class="secondary-button" type="button" id="retry-button">Try again</button>
+          </div>
+        </section>
+
+        <div class="report" id="results" hidden data-testid="results">
+          <header class="report-header">
+            <div>
+              <div class="report-kicker">
+                <span id="report-phase">Prefill</span>
+                <span aria-hidden="true">·</span>
+                <span id="report-workload">4,096 tokens</span>
+              </div>
+              <h2>Inference lower-bound report</h2>
+              <p id="report-status">Optimistic analytical lower bound; not measured.</p>
+            </div>
+            <div class="report-meta">
+              <span>Generated <time id="generated-time"></time></span>
+              <button class="secondary-button" id="export-json" type="button">
+                Export JSON
+              </button>
+            </div>
+          </header>
+
+          <section class="report-section executive-section" aria-labelledby="executive-title">
+            <div class="section-heading">
+              <div>
+                <p class="section-number">01</p>
+                <h3 id="executive-title">Executive comparison</h3>
+                <p>End-to-end model time across the selected GPU families at one TP size.</p>
+              </div>
+            </div>
+            <div class="comparison-cards" id="comparison-cards" data-testid="comparison-cards"></div>
+            <div class="table-scroll comparison-table-wrap">
+              <table class="data-table comparison-table" data-testid="comparison-table">
+                <thead>
+                  <tr>
+                    <th scope="col">System</th>
+                    <th scope="col">TP size</th>
+                    <th scope="col" class="numeric">Model time</th>
+                    <th scope="col" class="numeric">Ideal throughput</th>
+                    <th scope="col" class="numeric">Weights / GPU</th>
+                    <th scope="col" class="numeric">Peak / GPU</th>
+                    <th scope="col">Capacity</th>
+                    <th scope="col">Execution path</th>
+                  </tr>
+                </thead>
+                <tbody id="comparison-table-body"></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="report-section breakdown-section" aria-labelledby="breakdown-title" data-testid="stage-breakdown">
+            <div class="section-heading heading-with-control">
+              <div>
+                <p class="section-number">02</p>
+                <h3 id="breakdown-title">Where the time goes</h3>
+                <p>Exact stage latency, plus independent non-additive resource floors.</p>
+              </div>
+              <label class="select-label" for="breakdown-hardware">
+                <span class="sr-only">Hardware for breakdown</span>
+                <select id="breakdown-hardware"></select>
+              </label>
+            </div>
+            <div class="breakdown-grid">
+              <article class="chart-card stage-card">
+                <div class="card-heading">
+                  <div>
+                    <h4>Stage contribution</h4>
+                    <p>These mutually exclusive stage totals add to model time.</p>
+                  </div>
+                  <strong id="stage-total"></strong>
+                </div>
+                <div class="stacked-bar" id="stage-stacked-bar" role="img" aria-label="Latency contribution by stage"></div>
+                <div class="breakdown-legend" id="stage-legend"></div>
+              </article>
+
+              <article class="chart-card floor-card">
+                <div class="card-heading">
+                  <div>
+                    <h4>Layer limiting floors</h4>
+                    <p>Count of stages whose final bound is set by each floor.</p>
+                  </div>
+                </div>
+                <div class="floor-chart" id="floor-chart"></div>
+              </article>
+            </div>
+
+            <article class="chart-card resource-card">
+              <div class="card-heading">
+                <div>
+                  <h4>Aggregate resource-floor comparison</h4>
+                  <p>
+                    Compute, HBM, communication, and dependency floors overlap. They
+                    are diagnostics and must not be added together.
+                  </p>
+                </div>
+                <span class="diagnostic-badge">Non-additive</span>
+              </div>
+              <div class="resource-bars" id="resource-bars"></div>
+            </article>
+          </section>
+
+          <section class="report-section layer-section" aria-labelledby="layer-title">
+            <div class="section-heading heading-with-control">
+              <div>
+                <p class="section-number">03</p>
+                <h3 id="layer-title">All 96 model stages</h3>
+                <p>Embedding + 93 decoder layers + final norm + LM head.</p>
+              </div>
+              <label class="select-label" for="layer-hardware">
+                <span class="sr-only">Hardware for layer analysis</span>
+                <select id="layer-hardware"></select>
+              </label>
+            </div>
+            <article class="chart-card layer-chart-card">
+              <div class="chart-toolbar">
+                <div class="inline-legend" aria-label="Chart legend">
+                  <span><i class="legend-swatch embedding"></i>Other</span>
+                  <span><i class="legend-swatch kda"></i>KDA</span>
+                  <span><i class="legend-swatch mla"></i>MLA</span>
+                </div>
+                <span id="layer-chart-summary"></span>
+              </div>
+              <div class="canvas-wrap">
+                <canvas id="layer-chart" height="320" data-testid="layer-chart" role="img" aria-label="Model-stage latency chart">Model-stage latency is also available in the table below.</canvas>
+                <div class="chart-tooltip" id="chart-tooltip" role="status" hidden></div>
+              </div>
+            </article>
+
+            <div class="table-toolbar">
+              <div class="table-filter" role="search">
+                <span aria-hidden="true">⌕</span>
+                <label class="sr-only" for="layer-filter">Filter model stages</label>
+                <input id="layer-filter" type="search" placeholder="Filter stage, attention, FFN…" />
+              </div>
+              <div class="table-key">
+                <span><kbd>Enter</kbd> expand operators and calculation traces</span>
+              </div>
+            </div>
+            <div class="table-scroll layer-table-wrap">
+              <table class="data-table layer-table" data-testid="layer-table">
+                <thead>
+                  <tr>
+                    <th scope="col" aria-label="Expand"></th>
+                    <th scope="col">Stage</th>
+                    <th scope="col">Path</th>
+                    <th scope="col" class="numeric">Latency</th>
+                    <th scope="col" class="numeric">Share</th>
+                    <th scope="col">Dominant operation</th>
+                    <th scope="col">Layer floor</th>
+                  </tr>
+                </thead>
+                <tbody id="layer-table-body"></tbody>
+              </table>
+            </div>
+            <p class="table-note">
+              Select any operator to reveal the formula, substituted values, units,
+              and result behind every numeric field. Operator rooflines inside a layer
+              can overlap; layer time is the maximum of the dependency schedule and
+              aggregate compute, HBM, and communication resource floors.
+            </p>
+          </section>
+
+          <section class="report-section memory-section" aria-labelledby="memory-title" data-testid="memory-panel">
+            <div class="section-heading heading-with-control">
+              <div>
+                <p class="section-number">04</p>
+                <h3 id="memory-title">Memory accounting</h3>
+                <p>Per-rank accounted model and state against vendor-nameplate HBM.</p>
+              </div>
+              <label class="select-label" for="memory-hardware">
+                <span class="sr-only">Hardware for memory analysis</span>
+                <select id="memory-hardware"></select>
+              </label>
+            </div>
+            <div class="memory-grid">
+              <article class="chart-card memory-meter-card">
+                <div class="memory-headline">
+                  <div>
+                    <span>Accounted peak / GPU</span>
+                    <strong id="memory-total"></strong>
+                  </div>
+                  <span class="fit-badge" id="memory-fit"></span>
+                </div>
+                <div class="capacity-bar" id="capacity-bar" role="progressbar" aria-valuemin="0">
+                  <span></span>
+                </div>
+                <div class="capacity-labels">
+                  <span>0</span>
+                  <span id="memory-capacity"></span>
+                </div>
+                <div class="memory-components" id="memory-components"></div>
+              </article>
+              <article class="chart-card weight-card">
+                <div class="card-heading">
+                  <div>
+                    <h4>Static weight breakdown</h4>
+                    <p>Physical bytes resident on each rank.</p>
+                  </div>
+                </div>
+                <div class="weight-list" id="weight-list"></div>
+              </article>
+            </div>
+            <p class="memory-caveat">
+              This is not an OOM guarantee. Runtime reserve, allocator fragmentation,
+              workspaces, and unaccounted live activations remain outside the bound.
+            </p>
+          </section>
+
+          <section class="report-section manifest-section" aria-labelledby="manifest-title" data-testid="model-manifest">
+            <div class="section-heading">
+              <div>
+                <p class="section-number">05</p>
+                <h3 id="manifest-title">Model manifest</h3>
+                <p>Checkpoint facts used by every operation count in this report.</p>
+              </div>
+            </div>
+            <div class="manifest-content" id="manifest-content"></div>
+          </section>
+
+          <footer class="report-footer">
+            <div>
+              <strong>K3 Inference Calculator</strong>
+              <p>Built for falsifiable performance reasoning—not benchmark theater.</p>
+            </div>
+            <a href="#top">Back to inputs ↑</a>
+          </footer>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
