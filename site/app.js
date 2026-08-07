@@ -158,18 +158,15 @@ function parallelismLabel(hardware) {
 }
 
 function setView(view) {
-  const welcome = $("#welcome-state");
   const loading = $("#loading-state");
   const error = $("#error-state");
   const results = $("#results");
-  welcome.hidden = view !== "welcome";
   loading.hidden = view !== "loading";
   error.hidden = view !== "error";
   results.hidden = view !== "results";
   $("#report").setAttribute("aria-busy", view === "loading" ? "true" : "false");
   $("#calculation-status").textContent =
     {
-      welcome: "Calculator ready.",
       loading: "Updating calculation.",
       error: "Calculation failed.",
       results: "Calculation updated.",
@@ -1085,6 +1082,7 @@ async function init() {
   bindEvents();
   updatePhaseFields();
   updateHardwareState();
+  setView("loading");
   const connected = await loadManifest();
   state.ready = connected;
   if (connected) calculate();

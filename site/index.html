@@ -257,35 +257,9 @@
           aria-live="polite"
           aria-atomic="true"
         >
-          Calculator ready.
+          Updating calculation.
         </p>
-        <section class="welcome-state" id="welcome-state">
-          <div class="welcome-copy">
-            <p class="eyebrow">Kimi-K3 · Text model only</p>
-            <h2>See where every microsecond goes.</h2>
-            <p>
-              A transparent roofline report for 93 decoder layers, selectable
-              tensor parallelism, and three NVIDIA systems. Adjust the inputs to compare
-              the exact model path—not a generic transformer approximation.
-            </p>
-            <div class="model-at-a-glance" aria-label="Kimi-K3 model summary">
-              <div><strong>93</strong><span>decoder layers</span></div>
-              <div><strong>69 / 24</strong><span>KDA / MLA</span></div>
-              <div><strong>896 → 16</strong><span>experts / token</span></div>
-              <div><strong>7168</strong><span>hidden width</span></div>
-            </div>
-          </div>
-          <div class="welcome-visual" aria-hidden="true">
-            <div class="visual-axis"></div>
-            <div class="visual-row visual-row-1"><i></i><i></i><i></i><i></i><i></i><i></i></div>
-            <div class="visual-row visual-row-2"><i></i><i></i><i></i><i></i><i></i><i></i></div>
-            <div class="visual-row visual-row-3"><i></i><i></i><i></i><i></i><i></i><i></i></div>
-            <span class="visual-label visual-label-top">Compute ceiling</span>
-            <span class="visual-label visual-label-bottom">Memory ceiling</span>
-          </div>
-        </section>
-
-        <section class="loading-state" id="loading-state" aria-label="Calculating" hidden data-testid="loading">
+        <section class="loading-state" id="loading-state" aria-label="Calculating" data-testid="loading">
           <div class="loader-orbit" aria-hidden="true"><span></span></div>
           <div>
             <strong>Scheduling 96 model stages…</strong>
