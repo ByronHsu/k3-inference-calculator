@@ -253,10 +253,19 @@ class HardwareSpec:
         return self.ep_size if self.moe_sharding == "ep" else self.tp_size
 
     @property
+    def local_routed_experts(self) -> int:
+        if self.moe_sharding == "ep":
+            return KIMI_K3_TEXT_CONFIG.num_experts // self.ep_size
+        return KIMI_K3_TEXT_CONFIG.num_experts
+
+    @property
     def routed_expert_intermediate_size_per_partition(self) -> int:
-        exact = KIMI_K3_TEXT_CONFIG.moe_intermediate_size // self.moe_shard_size
-        if self.moe_sharding == "tp" and (
-            self.family in ("b300", "gb300") or "marlin" in self.moe_backend.lower()
+        if self.moe_sharding == "ep":
+            return KIMI_K3_TEXT_CONFIG.moe_intermediate_size
+        exact = KIMI_K3_TEXT_CONFIG.moe_intermediate_size // self.tp_size
+        if (
+            self.family in ("b300", "gb300")
+            or "marlin" in self.moe_backend.lower()
         ):
             # Both FlashInfer's Blackwell path and Marlin W4A16 physically pad
             # each TP-local expert-intermediate partition to 128 elements.
@@ -286,9 +295,12 @@ class HardwareSpec:
             raise ValueError(f"{self.id}: scoped presets require TP == GPU count.")
         if KIMI_K3_TEXT_CONFIG.num_attention_heads % self.tp_size:
             raise ValueError(f"{self.id}: TP does not divide 96 attention heads.")
-        if KIMI_K3_TEXT_CONFIG.moe_intermediate_size % self.moe_shard_size:
+        if (
+            self.moe_sharding == "tp"
+            and KIMI_K3_TEXT_CONFIG.moe_intermediate_size % self.tp_size
+        ):
             raise ValueError(
-                f"{self.id}: MoE shard size does not divide the routed intermediate width."
+                f"{self.id}: TP does not divide the routed intermediate width."
             )
         if self.nvlink_domain_size <= 0:
             raise ValueError(f"{self.id}: NVLink domain size must be positive.")
@@ -308,6 +320,7 @@ class HardwareSpec:
         result = asdict(self)
         result["local_attention_heads"] = self.local_attention_heads
         result["moe_shard_size"] = self.moe_shard_size
+        result["local_routed_experts"] = self.local_routed_experts
         result["routed_expert_intermediate_size_per_partition"] = (
             self.routed_expert_intermediate_size_per_partition
         )
@@ -489,6 +502,34 @@ HARDWARE_PRESETS: dict[str, HardwareSpec] = {
     ),
 }
 
+HARDWARE_PRESETS["h200-tpep32"] = replace(
+    HARDWARE_PRESETS["h200-tpep16"],
+    id="h200-tpep32",
+    label="H200 4x8 TP32+EP32",
+    gpu_count=32,
+    node_count=4,
+    tp_size=32,
+    ep_size=32,
+    recipe_status=(
+        "configured from SGLang's H200 high-throughput TP32+EP32 recipe; "
+        "final verification in progress"
+    ),
+    derivations=(
+        *HARDWARE_PRESETS["h200-tpep16"].derivations,
+        "SGLang's H200 high-throughput recipe widens to TP32+EP32 over four nodes.",
+    ),
+    warnings=(
+        "TP32 spans four separate eight-GPU NVLink domains and therefore "
+        "crosses NDR400.",
+        "The branch recipe forces NCCL_MNNVL_ENABLE=1, which requires runtime "
+        "validation on ordinary four-node H200 systems.",
+        "No MoE A2A backend is selected: tokens are replicated, experts are "
+        "local, and latent/shared outputs are reduced.",
+        "The 141 GB HBM value is a vendor-nameplate capacity; runtime-reported "
+        "and allocatable bytes can differ.",
+    ),
+)
+
 for _hardware in HARDWARE_PRESETS.values():
     _hardware.validate()
 
@@ -576,3 +617,15 @@ def make_tp_hardware(family: str, tp_size: int) -> HardwareSpec:
     )
     spec.validate()
     return spec
+
+
+def make_calculator_hardware(family: str, tp_size: int) -> HardwareSpec:
+    """Returns the recipe-backed topology selected by the public calculator."""
+    h200_ep_recipes = {
+        16: "h200-tpep16",
+        32: "h200-tpep32",
+    }
+    preset_id = h200_ep_recipes.get(tp_size) if family == "h200" else None
+    if preset_id is not None:
+        return HARDWARE_PRESETS[preset_id]
+    return make_tp_hardware(family, tp_size)

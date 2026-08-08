@@ -201,7 +201,8 @@ def _hardware_specs(
         tp_size = _tp_size(payload, analyzer)
         try:
             return tuple(
-                analyzer.make_tp_hardware(family, tp_size) for family in requested
+                analyzer.make_calculator_hardware(family, tp_size)
+                for family in requested
             )
         except ValueError as error:
             raise ApiError("invalid_request", str(error)) from error
@@ -318,21 +319,23 @@ def manifest_payload(analyzer: ModuleType | None = None) -> dict[str, Any]:
                     "b300": "B300",
                     "gb300": "GB300",
                 }[family],
-                "gpu": analyzer.make_tp_hardware(family, 8).gpu,
-                "gpus_per_node": analyzer.make_tp_hardware(family, 8).gpus_per_node,
-                "nvlink_domain_size": analyzer.make_tp_hardware(
+                "gpu": analyzer.make_calculator_hardware(family, 8).gpu,
+                "gpus_per_node": analyzer.make_calculator_hardware(
+                    family, 8
+                ).gpus_per_node,
+                "nvlink_domain_size": analyzer.make_calculator_hardware(
                     family, 8
                 ).nvlink_domain_size,
-                "nvlink_bytes_per_s_per_direction": analyzer.make_tp_hardware(
+                "nvlink_bytes_per_s_per_direction": analyzer.make_calculator_hardware(
                     family, 8
                 ).nvlink_bytes_per_s_per_direction,
-                "scaleout_bytes_per_s_per_gpu_per_direction": analyzer.make_tp_hardware(
+                "scaleout_bytes_per_s_per_gpu_per_direction": analyzer.make_calculator_hardware(
                     family, 8
                 ).scaleout_bytes_per_s_per_gpu_per_direction,
-                "prefill_chunk_size": analyzer.make_tp_hardware(
+                "prefill_chunk_size": analyzer.make_calculator_hardware(
                     family, 8
                 ).prefill_chunk_size,
-                "decode_cuda_graph_max_batch_size": analyzer.make_tp_hardware(
+                "decode_cuda_graph_max_batch_size": analyzer.make_calculator_hardware(
                     family, 8
                 ).decode_cuda_graph_max_batch_size,
             }
@@ -344,7 +347,7 @@ def manifest_payload(analyzer: ModuleType | None = None) -> dict[str, Any]:
                 "hardware": list(analyzer.CALCULATOR_HARDWARE_FAMILIES),
                 "tp_size": 64,
                 "reason": (
-                    "TP64 is not supported by TP-only Kimi-K3 because 96 KDA "
+                    "TP64 is not supported by Kimi-K3 because 96 KDA "
                     "attention heads do not divide evenly across 64 ranks."
                 ),
             }
