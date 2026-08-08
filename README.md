@@ -1,14 +1,17 @@
 # K3 Inference Calculator
 
 An interactive, per-layer roofline calculator for theoretical Kimi-K3 inference
-on NVIDIA H200, B300, and GB300 systems at TP8, TP16, and TP32.
+on NVIDIA H200, B300, and GB300 systems at TP8, TP16, and TP32. H200 TP16 and
+TP32 use the matching SGLang EP16 and EP32 recipes.
 
 **Live calculator:** <https://byronhsu.github.io/k3-inference-calculator/>
 
 The report covers cold prefill and decode, all 96 sequential model stages,
 per-operator FLOPs and HBM traffic, communication floors, formula substitutions,
-and per-rank memory accounting. Results are optimistic analytical lower bounds,
-not measured latency predictions or OOM guarantees.
+and per-rank memory accounting. Its interactive log-log roofline can be panned
+and zoomed to compare compute-, memory-bandwidth-, and communication-bound
+operators for the current Prefill or Decode workload. Results are optimistic analytical lower
+bounds, not measured latency predictions or OOM guarantees.
 
 ## How the public site works
 
@@ -38,6 +41,7 @@ because browsers block worker assets loaded from `file://` URLs.
 - Kimi-K3 text model: 93 decoder layers, with 69 KDA and 24 MLA layers
 - Hardware families: H200, B300, GB300
 - Tensor parallel sizes: 8, 16, 32
+- H200 recipe mappings: TP16/EP16 and TP32/EP32
 - H200 and B300 scale-out assumptions: 50 GB/s and 100 GB/s per GPU per direction
 - Default efficiencies: 100% compute, HBM, and collective utilization
 - Serving, scheduler, tokenizer, CPU, launch, and network-request overhead excluded

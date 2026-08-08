@@ -45,6 +45,10 @@ const state = {
   expandedLayers: new Set(),
   expandedOperations: new Set(),
   chartHits: [],
+  rooflineHits: [],
+  rooflineViews: new Map(),
+  rooflineLayout: null,
+  rooflineDrag: null,
   abortController: null,
   autoCalculateTimer: null,
   ready: false,
@@ -111,6 +115,17 @@ function formatFlops(flops, dashZero = false) {
   return `${formatNumber(value, value >= 100 ? 1 : 2)} ${units[index]}`;
 }
 
+function formatFlopsPerSecond(value) {
+  return `${formatFlops(value)}/s`;
+}
+
+function formatIntensity(value) {
+  const intensity = finite(value);
+  if (intensity >= 1000) return `${formatNumber(intensity / 1000, 2)}K FLOP/B`;
+  if (intensity >= 1) return `${formatNumber(intensity, 2)} FLOP/B`;
+  return `${formatNumber(intensity, 4)} FLOP/B`;
+}
+
 function formatRate(value) {
   const number = finite(value);
   if (number >= 1e9) return `${formatNumber(number / 1e9, 2)}G tok/s`;
@@ -153,8 +168,30 @@ function normalizeFloor(value) {
   return "dependency";
 }
 
+const FLOOR_LABELS = {
+  compute: "Compute",
+  hbm: "Memory bandwidth",
+  communication: "Communication",
+  dependency: "Dependency",
+};
+
+function floorLabel(value) {
+  return FLOOR_LABELS[normalizeFloor(value)];
+}
+
+function boundLabel(value) {
+  return `${floorLabel(value)}-bound`;
+}
+
 function parallelismLabel(hardware) {
+  if (hardware.moe_sharding === "ep") {
+    return `TP${hardware.tp_size} / EP${hardware.ep_size}`;
+  }
   return `TP${hardware.tp_size}`;
+}
+
+function expertParallelismLabel(hardware) {
+  return hardware.moe_sharding === "ep" ? `EP${hardware.ep_size}` : "EP off";
 }
 
 function setView(view) {
@@ -195,7 +232,10 @@ function setTheme(theme) {
   } catch {
     // Theme persistence is optional in privacy-restricted contexts.
   }
-  if (state.results.length) requestAnimationFrame(renderLayerChart);
+  if (state.results.length) {
+    requestAnimationFrame(renderLayerChart);
+    requestAnimationFrame(renderRooflineChart);
+  }
 }
 
 function currentPhase() {
@@ -391,6 +431,9 @@ async function calculate() {
     state.manifest = { ...(state.manifest || {}), ...body, results: undefined };
     state.expandedLayers.clear();
     state.expandedOperations.clear();
+    state.rooflineViews.clear();
+    state.rooflineLayout = null;
+    state.rooflineDrag = null;
     renderReport();
     setView("results");
   } catch (error) {
@@ -451,10 +494,16 @@ function renderReport() {
   $("#generated-time").textContent = time.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
   renderComparison();
-  for (const id of ["breakdown-hardware", "layer-hardware", "memory-hardware"]) {
+  for (const id of [
+    "breakdown-hardware",
+    "roofline-hardware",
+    "layer-hardware",
+    "memory-hardware",
+  ]) {
     populateHardwareSelect($(`#${id}`));
   }
   renderBreakdown();
+  renderRoofline();
   renderLayerAnalysis();
   renderMemory();
   renderManifest();
@@ -561,7 +610,7 @@ function renderBreakdown() {
   $("#floor-chart").innerHTML = Object.entries(floorCounts)
     .map(([floor, count]) => `
       <div class="floor-row">
-        <span>${escapeHtml(floor)}</span>
+        <span>${escapeHtml(floorLabel(floor))}</span>
         <span class="micro-bar"><i style="--bar-width:${(count / maxCount) * 100}%;--bar-color:${FLOOR_COLORS[floor]}"></i></span>
         <strong>${formatNumber(count)} / ${formatNumber(result.layers.length)}</strong>
       </div>`)
@@ -578,11 +627,577 @@ function renderBreakdown() {
       const ratio = result.total_seconds ? Math.min(value / result.total_seconds, 1) : 0;
       return `
         <div class="resource-column">
-          <div class="resource-column-head"><span>${escapeHtml(resource)}</span><strong>${escapeHtml(formatDuration(value))}</strong></div>
+          <div class="resource-column-head"><span>${escapeHtml(floorLabel(resource))}</span><strong>${escapeHtml(formatDuration(value))}</strong></div>
           <div class="resource-track" title="${escapeHtml(formatPercent(ratio))} of total if viewed independently"><i style="--bar-width:${ratio * 100}%;--bar-color:${FLOOR_COLORS[resource]}"></i></div>
         </div>`;
     })
     .join("");
+}
+
+function collectRooflineData(result) {
+  const pointGroups = new Map();
+  const communicationGroups = new Map();
+  const boundCounts = { compute: 0, hbm: 0, communication: 0 };
+
+  for (const layer of result.layers) {
+    const stageId = stageGroupForLayer(layer);
+    const stageLabel =
+      STAGE_GROUPS.find((group) => group.id === stageId)?.label || humanize(stageId);
+    for (const operation of layer.operations) {
+      const bottleneck = normalizeFloor(operation.bottleneck);
+      if (Object.hasOwn(boundCounts, bottleneck)) boundCounts[bottleneck] += 1;
+
+      const operationIntensity = finite(
+        operation.arithmetic_intensity_flops_per_hbm_byte,
+        Number.NaN,
+      );
+      const operationPerformance = finite(
+        operation.roofline_flops_per_second,
+        Number.NaN,
+      );
+      if (
+        operationIntensity > 0 &&
+        operationPerformance > 0 &&
+        Number.isFinite(operationIntensity) &&
+        Number.isFinite(operationPerformance)
+      ) {
+        const key = [
+          stageId,
+          operation.id,
+          operation.compute_kind,
+          bottleneck,
+        ].join(":");
+        const group = pointGroups.get(key) || {
+          id: operation.id,
+          name: operation.name,
+          stage: stageLabel,
+          computeKind: operation.compute_kind,
+          bottleneck,
+          count: 0,
+          flops: 0,
+          hbmBytes: 0,
+          duration: 0,
+          computeSeconds: 0,
+          hbmSeconds: 0,
+          communicationSeconds: 0,
+        };
+        group.count += 1;
+        group.flops += finite(operation.flops_per_rank);
+        group.hbmBytes += finite(operation.hbm_bytes_per_rank);
+        group.duration += finite(operation.duration_seconds);
+        group.computeSeconds += finite(operation.compute_seconds);
+        group.hbmSeconds += finite(operation.hbm_seconds);
+        group.communicationSeconds += finite(operation.communication_seconds);
+        pointGroups.set(key, group);
+      }
+
+      if (
+        finite(operation.communication_seconds) > 0 &&
+        finite(operation.flops_per_rank) === 0
+      ) {
+        const key = `${stageId}:${operation.id}`;
+        const group = communicationGroups.get(key) || {
+          id: operation.id,
+          name: operation.name,
+          stage: stageLabel,
+          count: 0,
+          seconds: 0,
+          logicalBytes: 0,
+        };
+        group.count += 1;
+        group.seconds += finite(operation.communication_seconds);
+        group.logicalBytes += finite(operation.logical_collective_bytes);
+        communicationGroups.set(key, group);
+      }
+    }
+  }
+
+  const points = Array.from(pointGroups.values())
+    .map((group) => ({
+      ...group,
+      intensity: group.flops / group.hbmBytes,
+      performance: group.flops / group.duration,
+    }))
+    .sort((left, right) => left.intensity - right.intensity);
+  const communicationOnly = Array.from(communicationGroups.values()).sort(
+    (left, right) => right.seconds - left.seconds,
+  );
+  return { points, communicationOnly, boundCounts };
+}
+
+function automaticRooflineView(result, points) {
+  const hardware = result.hardware;
+  const bandwidth = finite(hardware.hbm_bandwidth_bytes_per_s, 1);
+  const peaks = [
+    finite(hardware.dense_bf16_flops_per_s, 1),
+    finite(hardware.k3_expert_flops_per_s, 1),
+  ].filter((value) => value > 0);
+  const intensities = points.map((point) => point.intensity).filter((value) => value > 0);
+  intensities.push(...peaks.map((peak) => peak / bandwidth));
+  const performances = points
+    .map((point) => point.performance)
+    .filter((value) => value > 0);
+  performances.push(...peaks);
+
+  const xLogs = intensities.map((value) => Math.log10(value));
+  const yLogs = performances.map((value) => Math.log10(value));
+  let xMin = Math.floor(Math.min(...xLogs)) - 0.25;
+  let xMax = Math.ceil(Math.max(...xLogs)) + 0.25;
+  let yMin = Math.floor(Math.min(...yLogs)) - 0.25;
+  let yMax = Math.ceil(Math.max(...yLogs)) + 0.25;
+  if (xMax - xMin < 2) {
+    const center = (xMin + xMax) / 2;
+    xMin = center - 1;
+    xMax = center + 1;
+  }
+  if (yMax - yMin < 2) {
+    const center = (yMin + yMax) / 2;
+    yMin = center - 1;
+    yMax = center + 1;
+  }
+  return { xMin, xMax, yMin, yMax };
+}
+
+function rooflineViewKey(result) {
+  return `${result.hardware.id}:${result.workload.phase}`;
+}
+
+function logarithmicTicks(minimum, maximum, maximumTicks = 7) {
+  const first = Math.ceil(minimum);
+  const last = Math.floor(maximum);
+  const span = Math.max(0, last - first);
+  const step = Math.max(1, Math.ceil((span + 1) / maximumTicks));
+  const ticks = [];
+  for (let value = first; value <= last; value += step) ticks.push(value);
+  return ticks;
+}
+
+function standardRooflinePerformance(
+  intensity,
+  bandwidthBytesPerSecond,
+  peakFlopsPerSecond,
+) {
+  return Math.min(bandwidthBytesPerSecond * intensity, peakFlopsPerSecond);
+}
+
+function drawRooflineMark(context, point, x, y, radius, color) {
+  context.fillStyle = color;
+  context.strokeStyle = color;
+  context.lineWidth = 1.5;
+  context.beginPath();
+  if (point.bottleneck === "hbm") {
+    context.rect(x - radius, y - radius, radius * 2, radius * 2);
+  } else if (point.bottleneck === "communication") {
+    context.moveTo(x, y - radius - 1);
+    context.lineTo(x + radius + 1, y + radius);
+    context.lineTo(x - radius - 1, y + radius);
+    context.closePath();
+  } else {
+    context.arc(x, y, radius, 0, Math.PI * 2);
+  }
+  context.globalAlpha = 0.82;
+  context.fill();
+  context.globalAlpha = 1;
+  context.stroke();
+}
+
+function renderRooflineChart() {
+  const result = resultById($("#roofline-hardware")?.value);
+  const canvas = $("#roofline-chart");
+  if (!result || !canvas || canvas.hidden) return;
+  const rect = canvas.getBoundingClientRect();
+  if (rect.width < 20) return;
+
+  const data = collectRooflineData(result);
+  if (!data.points.length) return;
+  const key = rooflineViewKey(result);
+  if (!state.rooflineViews.has(key)) {
+    state.rooflineViews.set(key, automaticRooflineView(result, data.points));
+  }
+  const view = state.rooflineViews.get(key);
+  const width = rect.width;
+  const height = width < 640 ? 360 : 430;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.style.height = `${height}px`;
+  canvas.width = Math.round(width * dpr);
+  canvas.height = Math.round(height * dpr);
+  const context = canvas.getContext("2d");
+  context.scale(dpr, dpr);
+
+  const css = getComputedStyle(document.documentElement);
+  const colors = {
+    grid: css.getPropertyValue("--line-soft").trim(),
+    frame: css.getPropertyValue("--line").trim(),
+    text: css.getPropertyValue("--text-dim").trim(),
+    strongText: css.getPropertyValue("--text-muted").trim(),
+    compute: css.getPropertyValue("--purple").trim(),
+    hbm: css.getPropertyValue("--cyan").trim(),
+    communication: css.getPropertyValue("--orange").trim(),
+    expert: css.getPropertyValue("--accent").trim(),
+  };
+  const padding = {
+    top: 30,
+    right: 20,
+    bottom: 58,
+    left: width < 640 ? 60 : 72,
+  };
+  const plotWidth = width - padding.left - padding.right;
+  const plotHeight = height - padding.top - padding.bottom;
+  const xRange = view.xMax - view.xMin;
+  const yRange = view.yMax - view.yMin;
+  const xScale = (logValue) =>
+    padding.left + ((logValue - view.xMin) / xRange) * plotWidth;
+  const yScale = (logValue) =>
+    padding.top + ((view.yMax - logValue) / yRange) * plotHeight;
+
+  context.clearRect(0, 0, width, height);
+  context.font = "9px SFMono-Regular, Consolas, monospace";
+  context.textBaseline = "middle";
+  context.lineWidth = 1;
+
+  for (const tick of logarithmicTicks(view.xMin, view.xMax)) {
+    const x = xScale(tick) + 0.5;
+    context.strokeStyle = colors.grid;
+    context.beginPath();
+    context.moveTo(x, padding.top);
+    context.lineTo(x, padding.top + plotHeight);
+    context.stroke();
+    context.fillStyle = colors.text;
+    context.textAlign = "center";
+    context.fillText(formatIntensity(10 ** tick).replace(" FLOP/B", ""), x, height - 37);
+  }
+  for (const tick of logarithmicTicks(view.yMin, view.yMax)) {
+    const y = yScale(tick) + 0.5;
+    context.strokeStyle = colors.grid;
+    context.beginPath();
+    context.moveTo(padding.left, y);
+    context.lineTo(padding.left + plotWidth, y);
+    context.stroke();
+    context.fillStyle = colors.text;
+    context.textAlign = "right";
+    context.fillText(formatFlopsPerSecond(10 ** tick), padding.left - 8, y);
+  }
+  context.strokeStyle = colors.frame;
+  context.strokeRect(padding.left + 0.5, padding.top + 0.5, plotWidth, plotHeight);
+
+  context.fillStyle = colors.strongText;
+  context.textAlign = "center";
+  context.fillText("Arithmetic intensity · FLOP / HBM byte", padding.left + plotWidth / 2, height - 13);
+  context.save();
+  context.translate(13, padding.top + plotHeight / 2);
+  context.rotate(-Math.PI / 2);
+  context.fillText("Effective per-rank throughput · FLOP/s", 0, 0);
+  context.restore();
+
+  const bandwidth = finite(result.hardware.hbm_bandwidth_bytes_per_s);
+  const densePeak = finite(result.hardware.dense_bf16_flops_per_s);
+  const expertPeak = finite(result.hardware.k3_expert_flops_per_s);
+  context.save();
+  context.beginPath();
+  context.rect(padding.left, padding.top, plotWidth, plotHeight);
+  context.clip();
+
+  const distinctExpertRoof =
+    Math.abs(expertPeak - densePeak) / Math.max(densePeak, 1) > 0.01;
+  const rooflines = [
+    ...(distinctExpertRoof
+      ? [{ label: "Expert compute peak", value: expertPeak, color: colors.expert, dashed: true }]
+      : []),
+    {
+      label: distinctExpertRoof ? "BF16 compute peak" : "Compute peak",
+      value: densePeak,
+      color: colors.compute,
+    },
+  ];
+  for (const roof of rooflines) {
+    const ridgeLogX = Math.log10(roof.value / bandwidth);
+    const logXValues = [view.xMin];
+    if (ridgeLogX > view.xMin && ridgeLogX < view.xMax) {
+      logXValues.push(ridgeLogX);
+    }
+    logXValues.push(view.xMax);
+    context.strokeStyle = roof.color;
+    context.lineWidth = 1.8;
+    context.setLineDash(roof.dashed ? [6, 4] : []);
+    context.beginPath();
+    for (const [index, logX] of logXValues.entries()) {
+      const performance = standardRooflinePerformance(
+        10 ** logX,
+        bandwidth,
+        roof.value,
+      );
+      const x = xScale(logX);
+      const y = yScale(Math.log10(performance));
+      if (index === 0) context.moveTo(x, y);
+      else context.lineTo(x, y);
+    }
+    context.stroke();
+  }
+  context.setLineDash([]);
+
+  state.rooflineHits = [];
+  const maxCount = Math.max(...data.points.map((point) => point.count), 1);
+  for (const point of data.points) {
+    const logX = Math.log10(point.intensity);
+    const logY = Math.log10(point.performance);
+    if (
+      logX < view.xMin ||
+      logX > view.xMax ||
+      logY < view.yMin ||
+      logY > view.yMax
+    ) {
+      continue;
+    }
+    const x = xScale(logX);
+    const y = yScale(logY);
+    const radius = 3.5 + 3.5 * Math.sqrt(point.count / maxCount);
+    drawRooflineMark(context, point, x, y, radius, colors[point.bottleneck]);
+    state.rooflineHits.push({ x, y, radius: Math.max(radius, 7), point });
+  }
+  context.restore();
+
+  const lowestRidgeLogX = Math.log10(
+    Math.min(...rooflines.map((roof) => roof.value)) / bandwidth,
+  );
+  const memoryLabelXLog = Math.min(
+    view.xMin + xRange * 0.12,
+    lowestRidgeLogX - 0.12,
+  );
+  const memoryLabelYLog = Math.log10(
+    standardRooflinePerformance(
+      10 ** memoryLabelXLog,
+      bandwidth,
+      Math.min(...rooflines.map((roof) => roof.value)),
+    ),
+  );
+  if (memoryLabelYLog > view.yMin && memoryLabelYLog < view.yMax) {
+    context.fillStyle = colors.strongText;
+    context.textAlign = "left";
+    context.fillText(
+      `Memory-bandwidth roof · ${formatBytes(bandwidth)}/s`,
+      xScale(memoryLabelXLog) + 5,
+      yScale(memoryLabelYLog) - 9,
+    );
+  }
+  for (const roof of rooflines) {
+    const logY = Math.log10(roof.value);
+    if (logY <= view.yMin || logY >= view.yMax) continue;
+    context.fillStyle = roof.color;
+    context.textAlign = "right";
+    const label = `${roof.label} · ${formatFlopsPerSecond(roof.value)}`;
+    context.fillText(label, padding.left + plotWidth - 7, yScale(logY) - 9);
+  }
+
+  state.rooflineLayout = {
+    key,
+    result,
+    data,
+    padding,
+    plotWidth,
+    plotHeight,
+    view: { ...view },
+  };
+  canvas.setAttribute(
+    "aria-label",
+    `${hardwareMeta(result).short} ${result.workload.phase} roofline with ${data.points.length} grouped arithmetic operators. Drag to pan and use the wheel to zoom.`,
+  );
+}
+
+function renderRoofline() {
+  const result = resultById($("#roofline-hardware")?.value);
+  if (!result) return;
+  const data = collectRooflineData(result);
+  const phase = result.workload.phase === "prefill" ? "Prefill" : "Decode";
+  const hardware = result.hardware;
+  const expertParallelism = expertParallelismLabel(hardware);
+  $("#roofline-summary").textContent =
+    `${phase} · TP${hardware.tp_size} · ${expertParallelism} · ${formatNumber(data.points.length)} grouped points`;
+
+  const topologyRows = [
+    ["Tensor parallel", `TP${hardware.tp_size}`],
+    ["Expert parallel", expertParallelism],
+    [
+      "MoE sharding",
+      hardware.moe_sharding === "ep" ? "Expert parallel" : "Tensor parallel",
+    ],
+    ["Routed experts / rank", formatNumber(hardware.local_routed_experts)],
+  ];
+  $("#roofline-topology").innerHTML = topologyRows
+    .map(
+      ([label, value]) => `
+        <div class="roofline-topology-row">
+          <span>${escapeHtml(label)}</span>
+          <strong>${escapeHtml(value)}</strong>
+        </div>`,
+    )
+    .join("");
+
+  $("#roofline-boundary-summary").innerHTML = ["compute", "hbm", "communication"]
+    .map(
+      (bound) => `
+        <div class="roofline-bound-row ${bound}">
+          <span><i></i>${escapeHtml(boundLabel(bound))}</span>
+          <strong>${formatNumber(data.boundCounts[bound])}</strong>
+        </div>`,
+    )
+    .join("");
+
+  const maximumCommunication = Math.max(
+    ...data.communicationOnly.map((operation) => operation.seconds),
+    1e-12,
+  );
+  $("#roofline-communication-list").innerHTML = data.communicationOnly.length
+    ? data.communicationOnly
+        .slice(0, 6)
+        .map(
+          (operation) => `
+            <div class="roofline-communication-row">
+              <span title="${escapeHtml(operation.name)}">${escapeHtml(operation.name)}</span>
+              <strong>${escapeHtml(formatDuration(operation.seconds))}</strong>
+              <span class="micro-bar"><i style="--bar-width:${(operation.seconds / maximumCommunication) * 100}%;--bar-color:${FLOOR_COLORS.communication}"></i></span>
+              <small>${formatNumber(operation.count)}× · ${escapeHtml(formatBytes(operation.logicalBytes))} logical</small>
+            </div>`,
+        )
+        .join("")
+    : '<p class="roofline-empty">No communication-only operators.</p>';
+  requestAnimationFrame(renderRooflineChart);
+}
+
+function showRooflineTooltip(event) {
+  const canvas = $("#roofline-chart");
+  const tooltip = $("#roofline-tooltip");
+  if (!canvas || !tooltip || state.rooflineDrag) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  let nearest = null;
+  let nearestDistance = Infinity;
+  for (const hit of state.rooflineHits) {
+    const distance = Math.hypot(x - hit.x, y - hit.y);
+    if (distance <= hit.radius + 7 && distance < nearestDistance) {
+      nearest = hit;
+      nearestDistance = distance;
+    }
+  }
+  if (!nearest) {
+    tooltip.hidden = true;
+    return;
+  }
+  const point = nearest.point;
+  tooltip.innerHTML = `
+    <strong>${escapeHtml(point.name)}</strong>
+    <span>${escapeHtml(point.stage)} · ${formatNumber(point.count)} occurrence${point.count === 1 ? "" : "s"}</span>
+    <span>${escapeHtml(formatIntensity(point.intensity))} · ${escapeHtml(formatFlopsPerSecond(point.performance))}</span>
+    <span>${escapeHtml(boundLabel(point.bottleneck))} · C ${escapeHtml(formatDuration(point.computeSeconds, true))} · HBM ${escapeHtml(formatDuration(point.hbmSeconds, true))} · Comm ${escapeHtml(formatDuration(point.communicationSeconds, true))}</span>`;
+  tooltip.style.left = `${Math.max(105, Math.min(rect.width - 105, nearest.x))}px`;
+  tooltip.style.top = `${Math.max(88, nearest.y)}px`;
+  tooltip.hidden = false;
+}
+
+function resetRooflineView() {
+  const result = resultById($("#roofline-hardware")?.value);
+  if (!result) return;
+  state.rooflineViews.delete(rooflineViewKey(result));
+  state.rooflineDrag = null;
+  $("#roofline-chart")?.classList.remove("is-dragging");
+  $("#roofline-tooltip").hidden = true;
+  renderRooflineChart();
+}
+
+function startRooflinePan(event) {
+  const layout = state.rooflineLayout;
+  const canvas = $("#roofline-chart");
+  if (!layout || !canvas || event.button !== 0) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const { padding, plotWidth, plotHeight } = layout;
+  if (
+    x < padding.left ||
+    x > padding.left + plotWidth ||
+    y < padding.top ||
+    y > padding.top + plotHeight
+  ) {
+    return;
+  }
+  canvas.setPointerCapture(event.pointerId);
+  canvas.classList.add("is-dragging");
+  $("#roofline-tooltip").hidden = true;
+  state.rooflineDrag = {
+    pointerId: event.pointerId,
+    startX: event.clientX,
+    startY: event.clientY,
+    view: { ...layout.view },
+    plotWidth,
+    plotHeight,
+    key: layout.key,
+  };
+}
+
+function moveRooflinePointer(event) {
+  const drag = state.rooflineDrag;
+  if (!drag || drag.pointerId !== event.pointerId) {
+    showRooflineTooltip(event);
+    return;
+  }
+  const xRange = drag.view.xMax - drag.view.xMin;
+  const yRange = drag.view.yMax - drag.view.yMin;
+  const xShift = -((event.clientX - drag.startX) / drag.plotWidth) * xRange;
+  const yShift = ((event.clientY - drag.startY) / drag.plotHeight) * yRange;
+  state.rooflineViews.set(drag.key, {
+    xMin: drag.view.xMin + xShift,
+    xMax: drag.view.xMax + xShift,
+    yMin: drag.view.yMin + yShift,
+    yMax: drag.view.yMax + yShift,
+  });
+  renderRooflineChart();
+}
+
+function endRooflinePan(event) {
+  const drag = state.rooflineDrag;
+  if (!drag || drag.pointerId !== event.pointerId) return;
+  const canvas = $("#roofline-chart");
+  if (canvas?.hasPointerCapture(event.pointerId)) {
+    canvas.releasePointerCapture(event.pointerId);
+  }
+  canvas?.classList.remove("is-dragging");
+  state.rooflineDrag = null;
+}
+
+function zoomRoofline(event) {
+  const layout = state.rooflineLayout;
+  const canvas = $("#roofline-chart");
+  if (!layout || !canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  const x = event.clientX - rect.left;
+  const y = event.clientY - rect.top;
+  const { padding, plotWidth, plotHeight, view } = layout;
+  if (
+    x < padding.left ||
+    x > padding.left + plotWidth ||
+    y < padding.top ||
+    y > padding.top + plotHeight
+  ) {
+    return;
+  }
+  event.preventDefault();
+  const factor = Math.exp(Math.max(-400, Math.min(400, event.deltaY)) * 0.0015);
+  const oldXRange = view.xMax - view.xMin;
+  const oldYRange = view.yMax - view.yMin;
+  const newXRange = Math.max(0.6, Math.min(10, oldXRange * factor));
+  const newYRange = Math.max(0.6, Math.min(10, oldYRange * factor));
+  const xRatio = (x - padding.left) / plotWidth;
+  const yRatio = (padding.top + plotHeight - y) / plotHeight;
+  const anchorX = view.xMin + xRatio * oldXRange;
+  const anchorY = view.yMin + yRatio * oldYRange;
+  state.rooflineViews.set(layout.key, {
+    xMin: anchorX - xRatio * newXRange,
+    xMax: anchorX + (1 - xRatio) * newXRange,
+    yMin: anchorY - yRatio * newYRange,
+    yMax: anchorY + (1 - yRatio) * newYRange,
+  });
+  $("#roofline-tooltip").hidden = true;
+  renderRooflineChart();
 }
 
 function renderLayerAnalysis() {
@@ -699,7 +1314,7 @@ function renderLayerTable() {
         <td class="numeric">${escapeHtml(formatDuration(layer.latency_seconds))}</td>
         <td class="numeric share-cell"><span class="share-inline"><span class="micro-bar"><i style="--bar-width:${barWidth}%;--bar-color:${pathClass === "kda" ? "var(--accent)" : pathClass === "mla" ? "var(--purple)" : "var(--text-dim)"}"></i></span><span>${escapeHtml(formatPercent(share, 2))}</span></span></td>
         <td>${escapeHtml(dominant?.name || layer.dominant_operation)}</td>
-        <td><span class="resource-chip ${floor}">${escapeHtml(floor)}</span></td>
+        <td><span class="resource-chip ${floor}">${escapeHtml(floorLabel(floor))}</span></td>
       </tr>`);
     if (expanded) rows.push(operationTable(layer, index, key));
   });
@@ -733,7 +1348,7 @@ function operationTable(layer, index, key) {
           <td class="numeric">${escapeHtml(formatDuration(operation.hbm_seconds, true))}</td>
           <td class="numeric">${escapeHtml(formatDuration(operation.communication_seconds, true))}</td>
           <td class="numeric"><strong>${escapeHtml(formatDuration(operation.duration_seconds))}</strong></td>
-          <td><span class="bottleneck-chip ${normalizeFloor(operation.bottleneck)}">${escapeHtml(operation.bottleneck)}</span></td>
+          <td><span class="bottleneck-chip ${normalizeFloor(operation.bottleneck)}">${escapeHtml(boundLabel(operation.bottleneck))}</span></td>
           <td>${notes.length ? `
             <details class="notes-disclosure">
               <summary class="notes-button" aria-label="Show notes for ${escapeHtml(operation.name)}">i</summary>
@@ -898,7 +1513,7 @@ function showChartTooltip(event) {
     tooltip.hidden = true;
     return;
   }
-  tooltip.innerHTML = `<strong>${escapeHtml(hit.layer.number == null ? humanize(hit.layer.name) : `Layer ${hit.layer.number} · ${layerPathLabel(hit.layer)}`)}</strong><span>${escapeHtml(formatDuration(hit.layer.latency_seconds))} · ${escapeHtml(normalizeFloor(hit.layer.limiting_floor))} floor</span>`;
+  tooltip.innerHTML = `<strong>${escapeHtml(hit.layer.number == null ? humanize(hit.layer.name) : `Layer ${hit.layer.number} · ${layerPathLabel(hit.layer)}`)}</strong><span>${escapeHtml(formatDuration(hit.layer.latency_seconds))} · ${escapeHtml(floorLabel(hit.layer.limiting_floor))} floor</span>`;
   const left = Math.max(80, Math.min(rect.width - 80, hit.x + hit.width / 2));
   tooltip.style.left = `${left}px`;
   tooltip.style.top = `${Math.max(58, hit.y)}px`;
@@ -1025,12 +1640,19 @@ function bindEvents() {
   });
   $("#retry-button").addEventListener("click", () => scheduleCalculate({ immediate: true }));
   $("#export-json").addEventListener("click", exportJson);
-  for (const id of ["breakdown-hardware", "layer-hardware", "memory-hardware"]) {
+  const analysisHardwareSelectors = [
+    "breakdown-hardware",
+    "roofline-hardware",
+    "layer-hardware",
+    "memory-hardware",
+  ];
+  for (const id of analysisHardwareSelectors) {
     $(`#${id}`).addEventListener("change", (event) => {
-      for (const otherId of ["breakdown-hardware", "layer-hardware", "memory-hardware"]) {
+      for (const otherId of analysisHardwareSelectors) {
         $(`#${otherId}`).value = event.target.value;
       }
       renderBreakdown();
+      renderRoofline();
       renderLayerAnalysis();
       renderMemory();
     });
@@ -1055,11 +1677,25 @@ function bindEvents() {
   $("#layer-chart").addEventListener("mouseleave", () => {
     $("#chart-tooltip").hidden = true;
   });
+  const rooflineCanvas = $("#roofline-chart");
+  rooflineCanvas.addEventListener("pointerdown", startRooflinePan);
+  rooflineCanvas.addEventListener("pointermove", moveRooflinePointer);
+  rooflineCanvas.addEventListener("pointerup", endRooflinePan);
+  rooflineCanvas.addEventListener("pointercancel", endRooflinePan);
+  rooflineCanvas.addEventListener("pointerleave", () => {
+    if (!state.rooflineDrag) $("#roofline-tooltip").hidden = true;
+  });
+  rooflineCanvas.addEventListener("wheel", zoomRoofline, { passive: false });
+  rooflineCanvas.addEventListener("dblclick", resetRooflineView);
+  $("#roofline-reset").addEventListener("click", resetRooflineView);
   let resizeTimer;
   window.addEventListener("resize", () => {
     clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
-      if (state.results.length) renderLayerChart();
+      if (state.results.length) {
+        renderRooflineChart();
+        renderLayerChart();
+      }
     }, 120);
   });
 }

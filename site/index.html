@@ -47,7 +47,7 @@
         <form id="calculator-form" novalidate>
           <div class="rail-heading">
             <p class="eyebrow">Workload</p>
-            <h1>Model the K3 forward pass.</h1>
+            <h1>Model Kimi K3 inference</h1>
             <p>
               Compare K3 tensor-parallel layouts using explicit compute,
               memory, and fabric ceilings.
@@ -156,7 +156,7 @@
                 />
                 <span>
                   <strong>H200</strong>
-                  <small>Scale-out · IB 50 GB/s</small>
+                  <small>TP8 · TP16/EP16 · TP32/EP32</small>
                 </span>
               </label>
               <label class="choice-option">
@@ -189,7 +189,7 @@
           </fieldset>
 
           <fieldset class="control-group choice-group tp-group">
-            <legend>Tensor parallel size</legend>
+            <legend>Tensor / H200 Expert parallel size</legend>
             <div class="choice-grid tp-options">
               <label class="choice-option compact-option">
                 <input
@@ -199,7 +199,16 @@
                   checked
                   data-testid="tp-size-8"
                 />
-                <span><strong>TP8</strong></span>
+                <span class="parallel-pair">
+                  <span class="parallel-dimension" data-dimension="tp">
+                    <small>TP</small>
+                    <strong>8</strong>
+                  </span>
+                  <span class="parallel-dimension" data-dimension="ep">
+                    <small>EP</small>
+                    <strong>off</strong>
+                  </span>
+                </span>
               </label>
               <label class="choice-option compact-option">
                 <input
@@ -208,11 +217,29 @@
                   value="16"
                   data-testid="tp-size-16"
                 />
-                <span><strong>TP16</strong></span>
+                <span class="parallel-pair">
+                  <span class="parallel-dimension" data-dimension="tp">
+                    <small>TP</small>
+                    <strong>16</strong>
+                  </span>
+                  <span class="parallel-dimension" data-dimension="ep">
+                    <small>EP</small>
+                    <strong>16</strong>
+                  </span>
+                </span>
               </label>
               <label class="choice-option compact-option">
                 <input type="radio" name="tp-size" value="32" data-testid="tp-size-32" />
-                <span><strong>TP32</strong></span>
+                <span class="parallel-pair">
+                  <span class="parallel-dimension" data-dimension="tp">
+                    <small>TP</small>
+                    <strong>32</strong>
+                  </span>
+                  <span class="parallel-dimension" data-dimension="ep">
+                    <small>EP</small>
+                    <strong>32</strong>
+                  </span>
+                </span>
               </label>
               <label class="choice-option compact-option unsupported-option">
                 <input
@@ -222,13 +249,20 @@
                   disabled
                   data-testid="tp-size-64"
                 />
-                <span>
-                  <strong>TP64</strong>
-                  <small>Unsupported</small>
+                <span class="parallel-pair">
+                  <span class="parallel-dimension" data-dimension="tp">
+                    <small>TP</small>
+                    <strong>64</strong>
+                  </span>
+                  <span class="parallel-dimension" data-dimension="ep">
+                    <small>EP</small>
+                    <strong>—</strong>
+                  </span>
                 </span>
               </label>
             </div>
             <p class="field-help tp-help">
+              EP labels apply to the H200 recipe. B300 and GB300 remain EP off.
               TP64 is unavailable: 96 attention heads are not divisible by 64.
             </p>
           </fieldset>
@@ -361,8 +395,8 @@
                 <div>
                   <h4>Aggregate resource-floor comparison</h4>
                   <p>
-                    Compute, HBM, communication, and dependency floors overlap. They
-                    are diagnostics and must not be added together.
+                    Compute, memory-bandwidth, communication, and dependency floors
+                    overlap. They are diagnostics and must not be added together.
                   </p>
                 </div>
                 <span class="diagnostic-badge">Non-additive</span>
@@ -371,10 +405,77 @@
             </article>
           </section>
 
-          <section class="report-section layer-section" aria-labelledby="layer-title">
+          <section class="report-section roofline-section" aria-labelledby="roofline-title" data-testid="roofline-panel">
             <div class="section-heading heading-with-control">
               <div>
                 <p class="section-number">03</p>
+                <h3 id="roofline-title">Interactive roofline</h3>
+                <p>Operational intensity versus effective per-rank throughput.</p>
+              </div>
+              <label class="select-label" for="roofline-hardware">
+                <span class="sr-only">Hardware for roofline analysis</span>
+                <select id="roofline-hardware"></select>
+              </label>
+            </div>
+            <article class="chart-card roofline-card">
+              <div class="chart-toolbar roofline-toolbar">
+                <div class="inline-legend roofline-legend" aria-label="Roofline legend">
+                  <span><i class="legend-swatch compute"></i>Compute-bound</span>
+                  <span><i class="legend-swatch hbm"></i>Memory bandwidth-bound</span>
+                  <span><i class="legend-swatch communication"></i>Communication-bound</span>
+                </div>
+                <div class="roofline-actions">
+                  <span id="roofline-summary"></span>
+                  <button class="secondary-button" id="roofline-reset" type="button">
+                    Reset view
+                  </button>
+                </div>
+              </div>
+              <div class="roofline-grid">
+                <div class="roofline-canvas-wrap">
+                  <canvas
+                    id="roofline-chart"
+                    height="430"
+                    data-testid="roofline-chart"
+                    role="img"
+                    aria-label="Interactive operation roofline chart"
+                  >
+                    Operation coordinates and bottlenecks are available in the
+                    model-stage table below.
+                  </canvas>
+                  <div class="chart-tooltip roofline-tooltip" id="roofline-tooltip" role="status" hidden></div>
+                </div>
+                <aside class="roofline-side" aria-label="Roofline resource summary">
+                  <div>
+                    <h4>Parallelism topology</h4>
+                    <p>Configuration applied to every plotted per-rank operator.</p>
+                    <div class="roofline-topology" id="roofline-topology"></div>
+                  </div>
+                  <div>
+                    <h4>Bound classification</h4>
+                    <p>Operator instances in the current Prefill or Decode pass.</p>
+                    <div class="roofline-boundary-summary" id="roofline-boundary-summary"></div>
+                  </div>
+                  <div>
+                    <h4>Communication-only operators</h4>
+                    <p>Zero-FLOP collectives cannot appear on a FLOP roofline.</p>
+                    <div class="roofline-communication-list" id="roofline-communication-list"></div>
+                  </div>
+                </aside>
+              </div>
+              <p class="roofline-note">
+                Drag to pan; use the wheel or trackpad to zoom. Each roofline is the
+                piecewise minimum of its memory-bandwidth slope and compute plateau.
+                Communication-bound points fall below it because collective topology
+                adds a third floor.
+              </p>
+            </article>
+          </section>
+
+          <section class="report-section layer-section" aria-labelledby="layer-title">
+            <div class="section-heading heading-with-control">
+              <div>
+                <p class="section-number">04</p>
                 <h3 id="layer-title">All 96 model stages</h3>
                 <p>Embedding + 93 decoder layers + final norm + LM head.</p>
               </div>
@@ -428,14 +529,14 @@
               Select any operator to reveal the formula, substituted values, units,
               and result behind every numeric field. Operator rooflines inside a layer
               can overlap; layer time is the maximum of the dependency schedule and
-              aggregate compute, HBM, and communication resource floors.
+              aggregate compute, memory-bandwidth, and communication resource floors.
             </p>
           </section>
 
           <section class="report-section memory-section" aria-labelledby="memory-title" data-testid="memory-panel">
             <div class="section-heading heading-with-control">
               <div>
-                <p class="section-number">04</p>
+                <p class="section-number">05</p>
                 <h3 id="memory-title">Memory accounting</h3>
                 <p>Per-rank accounted model and state against vendor-nameplate HBM.</p>
               </div>
@@ -481,7 +582,7 @@
           <section class="report-section manifest-section" aria-labelledby="manifest-title" data-testid="model-manifest">
             <div class="section-heading">
               <div>
-                <p class="section-number">05</p>
+                <p class="section-number">06</p>
                 <h3 id="manifest-title">Model manifest</h3>
                 <p>Checkpoint facts used by every operation count in this report.</p>
               </div>

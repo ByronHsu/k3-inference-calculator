@@ -185,12 +185,36 @@ class OperationEstimate:
     notes: tuple[str, ...]
     calculations: dict[str, CalculationProvenance]
 
+    @property
+    def arithmetic_intensity_flops_per_hbm_byte(self) -> float | None:
+        if (
+            self.flops_per_rank <= 0
+            or self.hbm_bytes_per_rank <= 0
+            or self.duration_seconds <= 0
+        ):
+            return None
+        return self.flops_per_rank / self.hbm_bytes_per_rank
+
+    @property
+    def roofline_flops_per_second(self) -> float | None:
+        if (
+            self.flops_per_rank <= 0
+            or self.hbm_bytes_per_rank <= 0
+            or self.duration_seconds <= 0
+        ):
+            return None
+        return self.flops_per_rank / self.duration_seconds
+
     def to_dict(self) -> dict:
         result = asdict(self)
         result["calculations"] = {
             field: calculation.to_dict()
             for field, calculation in self.calculations.items()
         }
+        result["arithmetic_intensity_flops_per_hbm_byte"] = (
+            self.arithmetic_intensity_flops_per_hbm_byte
+        )
+        result["roofline_flops_per_second"] = self.roofline_flops_per_second
         return result
 
 
@@ -1601,9 +1625,21 @@ def _expected_unique_experts(
 ) -> float:
     if tokens <= 0:
         return 0.0
+    if tokens == 1:
+        return local_experts * top_k / total_experts
     # Each token chooses top_k distinct experts. For any particular expert the
     # probability of omission by one uniform token is 1-top_k/total_experts.
     return local_experts * (1.0 - math.pow(1.0 - top_k / total_experts, tokens))
+
+
+def _marlin_m_block_size(*, tokens: int, top_k: int, local_experts: int) -> int:
+    """Returns SGLang Marlin's selected token-row block size."""
+
+    pairs_per_local_expert = tokens * top_k / local_experts
+    for block_size in (8, 16, 32, 48, 64):
+        if pairs_per_local_expert / block_size < 0.9:
+            return block_size
+    return 64
 
 
 def _moe_ffn(
@@ -1618,8 +1654,11 @@ def _moe_ffn(
     tokens = workload.token_count
     tp = hardware.tp_size
     shard = hardware.moe_shard_size
+    marlin_w4a16 = "marlin" in hardware.moe_backend.lower()
     blackwell_mxfp8 = (
-        hardware.family in ("b300", "gb300") and hardware.moe_sharding == "tp"
+        not marlin_w4a16
+        and hardware.family in ("b300", "gb300")
+        and hardware.moe_sharding == "tp"
     )
     shared_local = config.shared_intermediate_size // tp
     front_n = 2 * shared_local + config.num_experts + config.routed_expert_hidden_size
@@ -1654,15 +1693,18 @@ def _moe_ffn(
                 "H200 Marlin requires the strided fused-front latent slice to be contiguous for T>1.",
                 "The current-stream copy completes before ordinary shared and routed work.",
             ),
-        )
+    )
     if hardware.moe_sharding == "ep":
-        local_experts = config.num_experts // hardware.ep_size
+        local_experts = hardware.local_routed_experts
         local_expert_intermediate = config.moe_intermediate_size
         expert_bias_element_bytes = BF16_BYTES
         params_per_selected_expert = (
             3 * config.routed_expert_hidden_size * config.moe_intermediate_size
         )
-        sharding_note = "Uniform routing over EP-local full experts; no token all-to-all is present."
+        sharding_note = (
+            "Ideal-balance lower bound for the critical active EP rank over "
+            "EP-local full experts; no token all-to-all is present."
+        )
     else:
         local_experts = config.num_experts
         local_expert_intermediate = (
@@ -1674,39 +1716,102 @@ def _moe_ffn(
         )
         sharding_note = "All expert IDs are present as TP-sharded expert slices."
 
-    unique = _expected_unique_experts(
+    average_unique = _expected_unique_experts(
         total_experts=config.num_experts,
         local_experts=local_experts,
         tokens=tokens,
         top_k=config.num_experts_per_token,
     )
-    unique_formula = "local experts × (1 − (1 − top-k / total experts)^tokens)"
-    unique_substitution = (
+    average_unique_formula = (
+        "local experts × (1 − (1 − top-k / total experts)^tokens)"
+    )
+    average_unique_substitution = (
         f"{local_experts} × (1 − (1 − {config.num_experts_per_token} / "
         f"{config.num_experts})^{tokens})"
     )
-
-    local_compute_instances = tokens * config.num_experts_per_token / shard
     if hardware.moe_sharding == "ep":
+        # End-to-end latency is gated by an active rank, not by the average
+        # over active and idle ranks. With any routed work, that rank must load
+        # at least one expert even when the per-rank average is below one.
+        unique = max(1.0, average_unique)
+        unique_formula = f"max(1, {average_unique_formula})"
+        unique_substitution = f"max(1, {average_unique_substitution})"
+        occupancy_note = (
+            "The critical active EP rank reads at least "
+            f"{unique:.3f} unique local expert weights under ideal balance."
+        )
+    else:
+        unique = average_unique
+        unique_formula = average_unique_formula
+        unique_substitution = average_unique_substitution
+        occupancy_note = (
+            "Uniform-routing occupancy estimate reads "
+            f"{unique:.3f} unique local expert weights."
+        )
+
+    expert_pairs = tokens * config.num_experts_per_token
+    local_compute_instances = (
+        (expert_pairs + hardware.ep_size - 1) // hardware.ep_size
+        if hardware.moe_sharding == "ep"
+        else expert_pairs
+    )
+    expert_backend_notes: tuple[str, ...] = ()
+    if marlin_w4a16:
+        marlin_m_block = _marlin_m_block_size(
+            tokens=tokens,
+            top_k=config.num_experts_per_token,
+            local_experts=local_experts,
+        )
+        # For every routing realization, padded rows are at least both the
+        # useful-row count and one M-block per active expert. Taking the maximum
+        # of those expectations preserves the calculator's optimistic-bound
+        # contract without pretending the exact routing histogram is known.
+        padded_compute_instances = max(
+            local_compute_instances, unique * marlin_m_block
+        )
+        expert_flops = (
+            padded_compute_instances
+            * 6
+            * config.routed_expert_hidden_size
+            * local_expert_intermediate
+            + expert_pairs * 8 * local_expert_intermediate
+        )
+        expert_flops_formula = (
+            "max(local useful pairs, expected active local experts × Marlin M-block) "
+            "× 6 × routed width × local expert intermediate + tokens × top-k × "
+            "8 × local expert intermediate"
+        )
+        expert_flops_substitution = (
+            f"max({_display_number(local_compute_instances)}, "
+            f"{_display_number(unique)} × {marlin_m_block}) × 6 × "
+            f"{config.routed_expert_hidden_size} × {local_expert_intermediate} + "
+            f"{tokens} × {config.num_experts_per_token} × 8 × "
+            f"{local_expert_intermediate}"
+        )
+        expert_backend_notes = (
+            f"Marlin selects M-block {marlin_m_block}; the compute floor uses "
+            f"{padded_compute_instances:.3f} padded row-equivalents per rank.",
+            "The padded-row count is a lower bound on expected uniform-routing "
+            "work, not an exact routing histogram.",
+        )
+    elif hardware.moe_sharding == "ep":
         expert_flops = local_compute_instances * (
             6 * config.routed_expert_hidden_size * config.moe_intermediate_size
             + 8 * config.moe_intermediate_size
         )
         expert_flops_formula = (
-            "(tokens × top-k / EP) × (6 × routed width × expert intermediate + "
+            "ceil(tokens × top-k / EP) × (6 × routed width × expert intermediate + "
             "8 × expert intermediate)"
         )
         expert_flops_substitution = (
-            f"({tokens} × {config.num_experts_per_token} / {shard}) × "
-            f"(6 × {config.routed_expert_hidden_size} × {config.moe_intermediate_size} "
+            f"ceil({tokens} × {config.num_experts_per_token} / {shard}) × "
+            f"(6 × {config.routed_expert_hidden_size} × "
+            f"{config.moe_intermediate_size} "
             f"+ 8 × {config.moe_intermediate_size})"
         )
     else:
-        # Every token/expert pair runs on every TP rank. The selected routed
-        # backend pads its local intermediate partition to a multiple of 128.
         expert_flops = (
-            tokens
-            * config.num_experts_per_token
+            expert_pairs
             * (
                 6 * config.routed_expert_hidden_size * local_expert_intermediate
                 + 8 * local_expert_intermediate
@@ -1726,18 +1831,55 @@ def _moe_ffn(
         + (2 * local_expert_intermediate + config.routed_expert_hidden_size)
         * expert_bias_element_bytes
     )
-    if hardware.moe_sharding == "ep":
+    if hardware.moe_sharding == "ep" and marlin_w4a16:
+        # Marlin's caches retain all global token/expert pairs on every EP rank.
+        # Only GEMM rows that map to local experts scale down by EP.
+        marlin_pair_bytes = (
+            max(2 * local_expert_intermediate, config.routed_expert_hidden_size)
+            + 3 * local_expert_intermediate
+            + 2 * config.routed_expert_hidden_size
+        ) * BF16_BYTES
+        local_gemm_bytes = (
+            local_compute_instances
+            * (2 * config.routed_expert_hidden_size + 3 * local_expert_intermediate)
+            * BF16_BYTES
+        )
+        expert_activation_bytes = (
+            expert_pairs * marlin_pair_bytes
+            + local_gemm_bytes
+            + tokens * config.routed_expert_hidden_size * BF16_BYTES
+        )
+        expert_activation_formula = (
+            "tokens × top-k × (max(2 × expert intermediate, routed width) + "
+            "3 × expert intermediate + 2 × routed width) × BF16 bytes + "
+            "ceil(tokens × top-k / EP) × (2 × routed width + "
+            "3 × expert intermediate) "
+            "× BF16 bytes + tokens × routed width × BF16 output bytes"
+        )
+        expert_activation_substitution = (
+            f"{tokens} × {config.num_experts_per_token} × "
+            f"(max(2 × {local_expert_intermediate}, "
+            f"{config.routed_expert_hidden_size}) + 3 × "
+            f"{local_expert_intermediate} + 2 × "
+            f"{config.routed_expert_hidden_size}) × {BF16_BYTES} + "
+            f"({_display_number(local_compute_instances)}) × "
+            f"(2 × {config.routed_expert_hidden_size} + 3 × "
+            f"{local_expert_intermediate}) × {BF16_BYTES} + {tokens} × "
+            f"{config.routed_expert_hidden_size} × {BF16_BYTES}"
+        )
+    elif hardware.moe_sharding == "ep":
         expert_activation_bytes = (
             local_compute_instances
             * (2 * config.routed_expert_hidden_size + 3 * config.moe_intermediate_size)
             * BF16_BYTES
         )
         expert_activation_formula = (
-            "(tokens × top-k / EP) × (2 × routed width + 3 × expert intermediate) "
+            "ceil(tokens × top-k / EP) × (2 × routed width + "
+            "3 × expert intermediate) "
             "× BF16 bytes"
         )
         expert_activation_substitution = (
-            f"({tokens} × {config.num_experts_per_token} / {shard}) × "
+            f"ceil({tokens} × {config.num_experts_per_token} / {shard}) × "
             f"(2 × {config.routed_expert_hidden_size} + 3 × "
             f"{config.moe_intermediate_size}) × {BF16_BYTES}"
         )
@@ -1773,9 +1915,8 @@ def _moe_ffn(
         # [pairs, I], GEMM2 [pairs, K], and the final top-k reduction output
         # [tokens, K]. Count every producer write and consumer read, matching
         # the logical HBM convention used by the decomposed dense/shared paths.
-        marlin_pairs = tokens * config.num_experts_per_token
         expert_activation_bytes = (
-            marlin_pairs
+            expert_pairs
             * (4 * config.routed_expert_hidden_size + 6 * local_expert_intermediate)
             * BF16_BYTES
             + tokens * config.routed_expert_hidden_size * BF16_BYTES
@@ -1967,13 +2108,14 @@ def _moe_ffn(
         ),
         notes=(
             sharding_note,
-            f"Uniform-routing occupancy estimate reads {unique:.3f} unique local expert weights.",
+            occupancy_note,
             "MXFP4 traffic includes one uint8 scale per group of 32 weights.",
             (
                 "Blackwell routed GEMM1 activation reads are group-32 MXFP8; later routed intermediates/outputs remain BF16."
                 if blackwell_mxfp8
                 else "H200 Marlin routed activations remain BF16 (W4A16)."
             ),
+            *expert_backend_notes,
             "Synthetic backend expert biases are included at their retained dtype.",
         ),
     )
@@ -2006,7 +2148,8 @@ def _moe_ffn(
             notes=(
                 "Reduces one concatenated [latent 3584 | shared 7168] tensor.",
                 (
-                    "No token all-to-all: H200 EP16 evaluates only local experts."
+                    f"No token all-to-all: H200 EP{hardware.ep_size} evaluates "
+                    "only local experts."
                     if hardware.moe_sharding == "ep"
                     else "Blackwell K3 fused all-reduce path is disabled."
                 ),
@@ -2473,11 +2616,7 @@ def _weight_memory(
             breakdown["moe_router_latent_shared"] += (
                 dense_moe_bf16_params * bf16 + config.num_experts * FP32_BYTES
             )
-            local_experts = (
-                config.num_experts // hardware.ep_size
-                if hardware.moe_sharding == "ep"
-                else config.num_experts
-            )
+            local_experts = hardware.local_routed_experts
             local_intermediate = (
                 config.moe_intermediate_size
                 if hardware.moe_sharding == "ep"

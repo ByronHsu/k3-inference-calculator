@@ -19,6 +19,7 @@ from .specs import (
     KIMI_K3_TEXT_CONFIG,
     HardwareSpec,
     KimiK3TextConfig,
+    make_calculator_hardware,
     make_tp_hardware,
 )
 
@@ -34,5 +35,6 @@ __all__ = [
     "KimiK3TextConfig",
     "Workload",
     "estimate",
+    "make_calculator_hardware",
     "make_tp_hardware",
 ]
