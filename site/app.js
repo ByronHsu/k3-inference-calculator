@@ -18,10 +18,11 @@ const STAGE_GROUPS = [
 ];
 
 const FLOOR_COLORS = {
-  dependency: "#6aa6ff",
+  critical_path: "#6aa6ff",
   compute: "#a88cff",
   hbm: "#5ed6d2",
   communication: "#ffad5c",
+  unknown: "#8f969f",
 };
 
 const MEMORY_COLORS = ["#b8f455", "#a88cff", "#5ed6d2", "#ffad5c", "#6aa6ff"];
@@ -30,8 +31,8 @@ const AUTO_CALCULATE_DELAY_MS = 300;
 const OPERATION_CALCULATION_FIELDS = [
   { key: "flops_per_rank", label: "FLOPs / rank" },
   { key: "hbm_bytes_per_rank", label: "HBM bytes / rank" },
-  { key: "logical_collective_bytes", label: "Logical collective bytes" },
-  { key: "link_bytes_per_rank", label: "Physical link bytes / rank" },
+  { key: "logical_collective_bytes", label: "Logical collective payload" },
+  { key: "link_bytes_per_rank", label: "Fabric-byte diagnostic" },
   { key: "compute_seconds", label: "Compute floor" },
   { key: "hbm_seconds", label: "HBM floor" },
   { key: "communication_seconds", label: "Communication floor" },
@@ -161,18 +162,53 @@ function resultById(id) {
 }
 
 function normalizeFloor(value) {
-  const lower = String(value || "dependency").toLowerCase();
-  if (lower.includes("comm")) return "communication";
-  if (lower.includes("hbm") || lower.includes("memory")) return "hbm";
-  if (lower.includes("compute")) return "compute";
-  return "dependency";
+  const aliases = {
+    critical_path: "critical_path",
+    dependency: "critical_path",
+    compute: "compute",
+    compute_resource: "compute",
+    hbm: "hbm",
+    hbm_resource: "hbm",
+    communication: "communication",
+    communication_resource: "communication",
+  };
+  return aliases[String(value || "").toLowerCase()] || "unknown";
 }
 
 const FLOOR_LABELS = {
   compute: "Compute",
   hbm: "Memory bandwidth",
   communication: "Communication",
-  dependency: "Dependency",
+  critical_path: "Critical path",
+  unknown: "Unknown",
+};
+
+const CERTIFICATE_LABELS = {
+  critical_path: "Critical-path lower bound",
+  compute: "Compute-demand lower bound",
+  hbm: "HBM-demand lower bound",
+  communication: "Communication-demand lower bound",
+  unknown: "Unknown lower-bound certificate",
+};
+
+const PADDING_MODE_LABELS = {
+  max_len: "MAX_LEN",
+  sum_len: "SUM_LEN",
+  max_len_cuda_graph: "CUDA graph MAX_LEN",
+};
+
+const EXCLUDED_TERM_LABELS = {
+  megamoe_alignment_padding: "MegaMoE alignment/padding",
+  topk_compute: "TopK compute",
+  predispatch_quant_compute: "Pre-dispatch quantization compute",
+  expert_activation_compute: "Expert activation compute",
+  megamoe_internal_hbm_traffic: "MegaMoE internal HBM traffic",
+  fp8_scale_transport: "FP8 scale transport",
+  megamoe_control_metadata: "MegaMoE control metadata",
+  megamoe_symmetric_buffer_copies: "MegaMoE symmetric-buffer copies",
+  megamoe_transformed_weight_workspace: "MegaMoE transformed-weight workspace",
+  fabric_contention: "Fabric contention",
+  collective_startup: "Collective startup",
 };
 
 function floorLabel(value) {
@@ -180,12 +216,33 @@ function floorLabel(value) {
 }
 
 function boundLabel(value) {
-  return `${floorLabel(value)}-bound`;
+  const floor = normalizeFloor(value);
+  return floor === "unknown" ? "Unknown bound" : `${floorLabel(floor)}-bound`;
+}
+
+function certificateLabel(value) {
+  return CERTIFICATE_LABELS[normalizeFloor(value)];
+}
+
+function layerCertificates(layer) {
+  const values = Array.isArray(layer?.limiting_certificates)
+    ? layer.limiting_certificates
+    : [];
+  return [...new Set(values.map(normalizeFloor))];
+}
+
+function certificateChips(layer) {
+  return layerCertificates(layer)
+    .map(
+      (certificate) =>
+        `<span class="resource-chip ${certificate}">${escapeHtml(certificateLabel(certificate))}</span>`,
+    )
+    .join("");
 }
 
 function parallelismLabel(hardware) {
   if (hardware.moe_sharding === "ep") {
-    return `TP${hardware.tp_size} / EP${hardware.ep_size}`;
+    return `TP${hardware.tp_size}+EP${hardware.ep_size}`;
   }
   return `TP${hardware.tp_size}`;
 }
@@ -255,40 +312,140 @@ function selectedHardware() {
   return $$("input[name='hardware']:checked").map((input) => input.value);
 }
 
-function selectedTpSize() {
-  return Number($("input[name='tp-size']:checked")?.value);
+function selectedSharding() {
+  const input = $("input[name='sharding']:checked");
+  if (!input) return null;
+  const tpSize = Number(input.dataset.tpSize);
+  const moeSharding = input.dataset.moeSharding;
+  return {
+    id: input.value,
+    tpSize,
+    moeSharding,
+    label: moeSharding === "ep" ? `TP${tpSize}+EP${tpSize}` : `TP${tpSize}`,
+  };
 }
 
 function updateHardwareState() {
-  applyTpAvailability();
+  updateShardingCompatibility();
   updateSequenceLimit();
 }
 
-function applyTpAvailability() {
-  const selected = selectedHardware();
-  const invalid = Array.isArray(state.manifest?.invalid_combinations)
-    ? state.manifest.invalid_combinations
-    : [];
-  for (const input of $$("input[name='tp-size']")) {
-    const tpSize = Number(input.value);
-    const manifestInvalid = invalid.some((combination) => {
-      if (typeof combination === "string") {
-        return combination.toLowerCase().includes(`tp${tpSize}`);
-      }
-      if (!combination || Number(combination.tp_size) !== tpSize) return false;
-      const familyValue =
-        combination.hardware || combination.hardware_family || combination.family || [];
-      const families = (Array.isArray(familyValue) ? familyValue : [familyValue]).map(
-        (family) => String(family).toLowerCase(),
-      );
-      return !families.length || families.some((family) => selected.includes(family));
-    });
-    input.disabled = tpSize === 64 || manifestInvalid;
+function manifestShardingOption(id) {
+  const options = state.manifest?.sharding_options;
+  return Array.isArray(options) ? options.find((option) => option.id === id) : null;
+}
+
+function shardingSupport(sharding, family) {
+  const declared = manifestShardingOption(sharding.id)?.families?.[family];
+  if (declared && typeof declared === "object" && typeof declared.status === "string") {
+    return declared;
   }
-  const checked = $("input[name='tp-size']:checked");
-  if (checked?.disabled) {
-    const fallback = $("input[name='tp-size']:not(:disabled)");
-    if (fallback) fallback.checked = true;
+  return { status: "support_not_declared", reason: "Support is not declared by the manifest." };
+}
+
+function unsupportedSelectedHardware(sharding = selectedSharding()) {
+  if (!sharding) return [];
+  return selectedHardware()
+    .map((family) => ({ family, support: shardingSupport(sharding, family) }))
+    .filter(({ support }) => support.status !== "modeled");
+}
+
+function updateShardingCompatibility() {
+  const selected = selectedHardware();
+  const allFamilies = $$("input[name='hardware']").map((input) => input.value);
+  const hasSupportMatrix = Array.isArray(state.manifest?.sharding_options);
+  for (const input of $$("input[name='sharding']")) {
+    const sharding = {
+      id: input.value,
+      tpSize: Number(input.dataset.tpSize),
+      moeSharding: input.dataset.moeSharding,
+    };
+    const option = input.closest(".choice-option");
+    const description = $(`#${input.getAttribute("aria-describedby")}`, option);
+    if (!hasSupportMatrix) {
+      option.classList.remove("is-unavailable", "is-partial");
+      option.title = "Loading sharding support.";
+      if (description) description.textContent = "Loading sharding support.";
+      continue;
+    }
+    const unavailable = selected.filter(
+      (family) => shardingSupport(sharding, family).status !== "modeled",
+    );
+    option.classList.toggle(
+      "is-unavailable",
+      selected.length > 0 && unavailable.length === selected.length,
+    );
+    option.classList.toggle(
+      "is-partial",
+      unavailable.length > 0 && unavailable.length < selected.length,
+    );
+    const reasons = unavailable.map((family) => {
+      const reason = shardingSupport(sharding, family).reason || "Model unavailable.";
+      return `${family.toUpperCase()}: ${reason}`;
+    });
+    const modeledFamilies = allFamilies.filter(
+      (family) => shardingSupport(sharding, family).status === "modeled",
+    );
+    const unmodeledFamilies = allFamilies.filter(
+      (family) => shardingSupport(sharding, family).status !== "modeled",
+    );
+    const capacityLimited = modeledFamilies.filter(
+      (family) =>
+        shardingSupport(sharding, family).capacity_hint ===
+        "static_weights_exceed_nominal_hbm",
+    );
+    const supportText = modeledFamilies.length
+      ? `Modeled for ${modeledFamilies.map((family) => family.toUpperCase()).join(", ")}.`
+      : "Not modeled for any hardware family.";
+    const unavailableText = unmodeledFamilies.length
+      ? ` Not modeled for ${unmodeledFamilies
+          .map((family) => family.toUpperCase())
+          .join(", ")}.`
+      : "";
+    const capacityText = capacityLimited.length
+      ? ` Static weights exceed nominal HBM on ${capacityLimited
+          .map((family) => family.toUpperCase())
+          .join(", ")}.`
+      : "";
+    const descriptionText = `${supportText}${unavailableText}${capacityText}`;
+    option.title = [descriptionText, ...reasons].join(" ");
+    if (description) description.textContent = descriptionText;
+  }
+
+  const status = $("#sharding-support");
+  const sharding = selectedSharding();
+  if (!hasSupportMatrix) {
+    status.dataset.state = "loading";
+    status.textContent = "Loading sharding support…";
+    return;
+  }
+  const unsupported = unsupportedSelectedHardware(sharding);
+  const capacityLimited = sharding
+    ? selected.filter(
+        (family) =>
+          shardingSupport(sharding, family).capacity_hint ===
+          "static_weights_exceed_nominal_hbm",
+      )
+    : [];
+  if (!selected.length) {
+    status.dataset.state = "error";
+    status.textContent = "Select at least one hardware family.";
+  } else if (!sharding) {
+    status.dataset.state = "error";
+    status.textContent = "Select one sharding scenario.";
+  } else if (unsupported.length) {
+    const names = unsupported.map(({ family }) => family.toUpperCase()).join(", ");
+    status.dataset.state = "error";
+    status.textContent = `${sharding.label} is recognized but its execution model is unavailable for ${names}; no estimate will run.`;
+  } else if (capacityLimited.length) {
+    const names = capacityLimited.map((family) => family.toUpperCase()).join(", ");
+    status.dataset.state = "warning";
+    status.textContent = `${names} ${sharding.label} is modeled, but its static weights exceed nominal HBM.`;
+  } else {
+    status.dataset.state = "ok";
+    status.textContent = sharding.moeSharding === "ep"
+      ? `All selected families support ${sharding.label}; Blackwell uses attention TP8, DP=N/8, SP-MoE, and MegaMoE/DeepGEMM.`
+      : `All selected hardware families support ${sharding.label}.`;
   }
 }
 
@@ -319,9 +476,18 @@ function validateForm() {
   const phase = currentPhase();
   const hardware = selectedHardware();
   if (!hardware.length) return "Select at least one hardware family.";
-  const tpSize = selectedTpSize();
-  if (![8, 16, 32].includes(tpSize)) {
-    return "Select a supported tensor-parallel size: TP8, TP16, or TP32.";
+  const sharding = selectedSharding();
+  if (
+    !sharding ||
+    ![8, 16, 32].includes(sharding.tpSize) ||
+    !["tp", "ep"].includes(sharding.moeSharding)
+  ) {
+    return "Select one of the six supported sharding scenarios.";
+  }
+  const unsupported = unsupportedSelectedHardware(sharding);
+  if (unsupported.length) {
+    const names = unsupported.map(({ family }) => family.toUpperCase()).join(", ");
+    return `${sharding.label} is recognized but not modeled for ${names}. Deselect those hardware families or choose a TP-only scenario.`;
   }
   if (phase === "prefill") {
     const sequenceLength = Number($("#sequence-length").value);
@@ -355,15 +521,134 @@ function validateForm() {
 
 function requestPayload() {
   const phase = currentPhase();
+  const sharding = selectedSharding();
   const payload = {
     phase,
     hardware: selectedHardware(),
-    tp_size: selectedTpSize(),
+    tp_size: sharding.tpSize,
+    moe_sharding: sharding.moeSharding,
     batch_size: phase === "prefill" ? 1 : Number($("#batch-size").value),
   };
   if (phase === "prefill") payload.sequence_length = Number($("#sequence-length").value);
   else payload.context_length = Number($("#context-length").value);
   return payload;
+}
+
+function validateCalculatorResponse(payload, body) {
+  if (body?.schema_version !== 2) {
+    throw new Error("The calculator returned an unsupported response schema; no result was accepted.");
+  }
+  const results = Array.isArray(body.results) ? body.results : [];
+  if (!results.length) throw new Error("The calculator returned no hardware results.");
+  if (results.some((result) => !Array.isArray(result.layers) || !result.hardware)) {
+    throw new Error("The calculator response is missing its layer or hardware inventory.");
+  }
+
+  const requestedFamilies = [...new Set(payload.hardware.map((family) => String(family).toLowerCase()))];
+  if (requestedFamilies.length !== payload.hardware.length) {
+    throw new Error("The calculator request contains duplicate hardware families.");
+  }
+  const requestedSet = new Set(requestedFamilies);
+  const returnedFamilies = new Set();
+  const expectedTpSize = payload.tp_size;
+  const expectedMoeSharding = payload.moe_sharding;
+  const expectedEpSize = expectedMoeSharding === "ep" ? expectedTpSize : 1;
+
+  for (const result of results) {
+    const hardware = result.hardware;
+    const family = String(hardware.family || "").toLowerCase();
+    if (!requestedSet.has(family) || returnedFamilies.has(family)) {
+      throw new Error(
+        "The calculator returned an unexpected or duplicate hardware family; no result was accepted.",
+      );
+    }
+    returnedFamilies.add(family);
+    const certificateFields = [
+      ["critical_path", "critical_path_lower_bound_seconds"],
+      ["compute", "compute_resource_seconds"],
+      ["hbm", "hbm_resource_seconds"],
+      ["communication", "communication_resource_seconds"],
+    ];
+    for (const layer of result.layers) {
+      const values = certificateFields.map(([name, field]) => [name, layer?.[field]]);
+      if (
+        values.some(([, value]) => !Number.isFinite(value) || value < 0) ||
+        !Number.isFinite(layer?.latency_seconds) ||
+        layer.latency_seconds < 0 ||
+        !Array.isArray(layer?.limiting_certificates) ||
+        !layer.limiting_certificates.length
+      ) {
+        throw new Error(
+          `The calculator returned ${family.toUpperCase()} without the canonical lower-bound certificate fields; no result was accepted.`,
+        );
+      }
+      const expectedLatency = Math.max(...values.map(([, value]) => value));
+      const expectedCertificates = values
+        .filter(([, value]) => value === expectedLatency)
+        .map(([name]) => name);
+      if (
+        layer.latency_seconds !== expectedLatency ||
+        layer.limiting_certificates.length !== expectedCertificates.length ||
+        layer.limiting_certificates.some(
+          (name, index) => name !== expectedCertificates[index],
+        )
+      ) {
+        throw new Error(
+          `The calculator returned ${family.toUpperCase()} with inconsistent lower-bound certificates; no result was accepted.`,
+        );
+      }
+    }
+    if (
+      hardware.gpu_count !== expectedTpSize ||
+      hardware.tp_size !== expectedTpSize ||
+      hardware.moe_sharding !== expectedMoeSharding ||
+      hardware.ep_size !== expectedEpSize
+    ) {
+      throw new Error(
+        `The calculator returned ${family.toUpperCase()} with a sharding topology that does not match the request; no result was accepted.`,
+      );
+    }
+    const blackwellEp =
+      expectedMoeSharding === "ep" && ["b300", "gb300"].includes(family);
+    const ledger = result.parallel_work_ledger;
+    if (
+      blackwellEp &&
+      (hardware.execution_contract_id !== "kimi_k3_blackwell_megamoe_sp_v1" ||
+        ledger?.contract_id !== "kimi_k3_blackwell_parallel_ledger_v1" ||
+        ledger?.bound_condition_id !== "balanced_dp_fractional_uniform_ep_routing" ||
+        typeof ledger.bound_condition !== "string" ||
+        !ledger.bound_condition ||
+        typeof ledger.topology_contract !== "string" ||
+        !ledger.topology_contract ||
+        !Array.isArray(ledger.dp_mlp_aligned_rows) ||
+        ledger.dp_mlp_aligned_rows.length !== expectedTpSize / 8 ||
+        !Array.isArray(ledger.dp_model_rows) ||
+        ledger.dp_model_rows.length !== expectedTpSize / 8 ||
+        !Array.isArray(ledger.excluded_positive_term_ids) ||
+        !ledger.excluded_positive_term_ids.includes("megamoe_alignment_padding") ||
+        !ledger.excluded_positive_term_ids.includes("collective_startup"))
+    ) {
+      throw new Error(
+        `The calculator returned ${family.toUpperCase()} with a Blackwell EP execution recipe that does not match the request; no result was accepted.`,
+      );
+    }
+    const returnedWorkload = result.workload;
+    const workloadMatches =
+      returnedWorkload?.phase === payload.phase &&
+      returnedWorkload.batch_size === payload.batch_size &&
+      (payload.phase === "prefill"
+        ? returnedWorkload.sequence_length === payload.sequence_length
+        : returnedWorkload.context_length === payload.context_length);
+    if (!workloadMatches) {
+      throw new Error(
+        `The calculator returned ${family.toUpperCase()} with a workload that does not match the request; no result was accepted.`,
+      );
+    }
+  }
+  if (returnedFamilies.size !== requestedFamilies.length) {
+    throw new Error("The calculator returned a partial hardware comparison; no result was accepted.");
+  }
+  return results;
 }
 
 function scheduleCalculate({ immediate = false } = {}) {
@@ -396,13 +681,14 @@ async function calculate() {
   const controller = new AbortController();
   state.abortController = controller;
   setView("loading");
+  const payload = requestPayload();
 
   try {
     const response = await calculatorFetch("./api/calculate", {
       method: "POST",
       credentials: "same-origin",
       headers: { "Content-Type": "application/json", Accept: "application/json" },
-      body: JSON.stringify(requestPayload()),
+      body: JSON.stringify(payload),
       signal: controller.signal,
     });
     let body;
@@ -415,17 +701,7 @@ async function calculate() {
       throw new Error(body?.error?.message || `Calculation failed (${response.status}).`);
     }
     if (state.abortController !== controller || controller.signal.aborted) return;
-    const results = Array.isArray(body?.results)
-      ? body.results
-      : Array.isArray(body)
-        ? body
-        : body?.hardware
-          ? [body]
-          : [];
-    if (!results.length) throw new Error("The calculator returned no hardware results.");
-    if (results.some((result) => !Array.isArray(result.layers) || !result.hardware)) {
-      throw new Error("The calculator response is missing its layer or hardware inventory.");
-    }
+    const results = validateCalculatorResponse(payload, body);
     state.response = body;
     state.results = results;
     state.manifest = { ...(state.manifest || {}), ...body, results: undefined };
@@ -455,7 +731,7 @@ async function loadManifest() {
     const body = await response.json();
     if (body && typeof body === "object") {
       state.manifest = body;
-      applyTpAvailability();
+      updateShardingCompatibility();
       updateSequenceLimit();
       return true;
     }
@@ -486,8 +762,13 @@ function renderReport() {
   $("#report-workload").textContent =
     phase === "prefill"
       ? `${formatNumber(first.workload.sequence_length)} tokens · batch 1`
-      : `batch ${formatNumber(first.workload.batch_size)}${first.workload.model_batch_size !== first.workload.batch_size ? ` → ${formatNumber(first.workload.model_batch_size)} graph rows` : ""} · ${formatNumber(first.workload.context_length)} context · ${first.decode_cuda_graph_replay ? "CUDA graph replay" : "eager"}`;
-  const status = state.response?.analytical_status || state.manifest?.analytical_status || "optimistic lower bound; not measured";
+      : `batch ${formatNumber(first.workload.batch_size)}${first.workload.model_batch_size !== first.workload.batch_size ? ` → ${formatNumber(first.workload.model_batch_size)} execution rows` : ""} · ${formatNumber(first.workload.context_length)} context · ${first.decode_cuda_graph_replay ? "CUDA graph replay" : "eager"}`;
+  const hasConditionalEpScenario = state.results.some(
+    (result) => result.parallel_work_ledger?.bound_condition_id,
+  );
+  const status = hasConditionalEpScenario
+    ? "conditional analytical lower bound under logical HBM materialization, balanced DP assignment, and a fractional uniform-destination EP routing scenario; not measured"
+    : state.response?.analytical_status || state.manifest?.analytical_status || "optimistic lower bound; not measured";
   $("#report-status").textContent = `${status.charAt(0).toUpperCase()}${status.slice(1)}.`;
   const time = new Date();
   $("#generated-time").dateTime = time.toISOString();
@@ -512,29 +793,42 @@ function renderReport() {
 function renderComparison() {
   const cards = $("#comparison-cards");
   const fittingResults = state.results.filter(
-    (result) => result.memory.fits_nominal_capacity,
+    (result) => result.memory.fits_nominal_capacity === true,
   );
-  const fastest = Math.min(
-    ...fittingResults.map((result) => finite(result.total_seconds, Infinity)),
-  );
+  const fastest = fittingResults.length
+    ? Math.min(...fittingResults.map((result) => finite(result.total_seconds, Infinity)))
+    : null;
   cards.style.setProperty("--comparison-columns", String(Math.min(state.results.length, 3)));
   cards.innerHTML = state.results
     .map((result) => {
       const meta = hardwareMeta(result);
       const parts = durationParts(result.total_seconds);
       const fits = result.memory.fits_nominal_capacity;
-      const isFastest = fits && Math.abs(result.total_seconds - fastest) <= fastest * 1e-9;
-      const ratio = result.total_seconds / fastest;
+      const capacityUnknown = fits == null;
+      const isFastest = fits === true && fastest != null && Math.abs(result.total_seconds - fastest) <= fastest * 1e-9;
+      const ratio = fastest == null ? null : result.total_seconds / fastest;
       const memoryRatio = result.memory.total_accounted_peak_bytes_per_rank / result.memory.nominal_hbm_capacity_bytes_per_rank;
+      const conditionalRoute = result.parallel_work_ledger
+        ? "Conditional DP assignment and EP routing"
+        : null;
+      const capacityNote = fits === false
+        ? "Capacity-infeasible analytical result"
+        : capacityUnknown
+          ? "MegaMoE workspace excluded · fit is inconclusive"
+          : state.results.length === 1
+            ? "Selected configuration"
+            : isFastest
+              ? "Lowest lower bound among accounted-fit results"
+              : `${formatNumber((ratio - 1) * 100, 1)}% above the lowest accounted-fit lower bound`;
       return `
-        <article class="comparison-card ${isFastest ? "fastest" : ""} ${fits ? "" : "does-not-fit"}" style="--card-color:${meta.color}">
+        <article class="comparison-card ${isFastest ? "fastest" : ""} ${fits === false ? "does-not-fit" : ""} ${capacityUnknown ? "capacity-unknown" : ""}" style="--card-color:${meta.color}">
           <div class="card-system-row">
             <span class="system-name"><i class="system-dot"></i><strong>${escapeHtml(meta.short)} · ${escapeHtml(parallelismLabel(result.hardware))}</strong></span>
-            ${!fits ? '<span class="capacity-warning-badge">Does not fit</span>' : isFastest ? '<span class="winner-badge">Fastest runnable</span>' : ""}
+            ${fits === false ? '<span class="capacity-warning-badge">Does not fit</span>' : capacityUnknown ? '<span class="capacity-unknown-badge">Capacity unknown</span>' : isFastest ? '<span class="winner-badge">Lowest accounted-fit bound</span>' : ""}
           </div>
           <div>
             <div class="card-latency">${escapeHtml(parts.value)} <small>${escapeHtml(parts.unit)}</small></div>
-            <div class="card-subline">${!fits ? "Capacity-infeasible analytical result" : state.results.length === 1 ? "Selected configuration" : isFastest ? "Fastest selected runnable family" : `${formatNumber((ratio - 1) * 100, 1)}% slower than fastest runnable result`}</div>
+            <div class="card-subline">${escapeHtml([conditionalRoute, capacityNote].filter(Boolean).join(" · "))}</div>
           </div>
           <dl class="card-metrics">
             <div><dt>Ideal throughput</dt><dd>${escapeHtml(formatRate(result.ideal_tokens_per_second))}</dd></div>
@@ -561,7 +855,7 @@ function renderComparison() {
           <td class="numeric">${escapeHtml(formatRate(result.ideal_tokens_per_second))}</td>
           <td class="numeric">${escapeHtml(formatBytes(result.memory.static_weight_bytes_per_rank))}</td>
           <td class="numeric">${escapeHtml(formatBytes(result.memory.total_accounted_peak_bytes_per_rank))}</td>
-          <td><span class="fit-badge ${result.memory.fits_nominal_capacity ? "fits" : "over"}">${result.memory.fits_nominal_capacity ? "Fits nominal" : "Does not fit nominal HBM"}</span></td>
+          <td><span class="fit-badge ${result.memory.fits_nominal_capacity === true ? "fits" : result.memory.fits_nominal_capacity === false ? "over" : "unknown"}">${result.memory.fits_nominal_capacity === true ? "Fits accounted peak" : result.memory.fits_nominal_capacity === false ? "Accounted lower bound exceeds HBM" : "Fit inconclusive · workspace excluded"}</span></td>
           <td><span class="path-chip other">${escapeHtml(executionPath)}</span></td>
         </tr>`;
     })
@@ -604,34 +898,29 @@ function renderBreakdown() {
     return `<div class="legend-item" style="--item-color:${group.color}"><i></i><span>${escapeHtml(group.label)}</span><strong>${escapeHtml(formatDuration(totals[group.id]))} · ${escapeHtml(formatPercent(ratio))}</strong></div>`;
   }).join("");
 
-  const floorCounts = { dependency: 0, compute: 0, hbm: 0, communication: 0 };
-  for (const layer of result.layers) floorCounts[normalizeFloor(layer.limiting_floor)] += 1;
-  const maxCount = Math.max(1, ...Object.values(floorCounts));
-  $("#floor-chart").innerHTML = Object.entries(floorCounts)
-    .map(([floor, count]) => `
-      <div class="floor-row">
-        <span>${escapeHtml(floorLabel(floor))}</span>
-        <span class="micro-bar"><i style="--bar-width:${(count / maxCount) * 100}%;--bar-color:${FLOOR_COLORS[floor]}"></i></span>
-        <strong>${formatNumber(count)} / ${formatNumber(result.layers.length)}</strong>
-      </div>`)
-    .join("");
-
   const resources = {
-    dependency: result.layers.reduce((sumValue, layer) => sumValue + finite(layer.dependency_path_seconds), 0),
+    critical_path: result.layers.reduce((sumValue, layer) => sumValue + finite(layer.critical_path_lower_bound_seconds), 0),
     compute: result.layers.reduce((sumValue, layer) => sumValue + finite(layer.compute_resource_seconds), 0),
     hbm: result.layers.reduce((sumValue, layer) => sumValue + finite(layer.hbm_resource_seconds), 0),
     communication: result.layers.reduce((sumValue, layer) => sumValue + finite(layer.communication_resource_seconds), 0),
   };
+  $("#resource-bars").setAttribute(
+    "aria-label",
+    Object.entries(resources)
+      .map(([resource, value]) => `${certificateLabel(resource)} ${formatDuration(value)}`)
+      .join(", "),
+  );
   $("#resource-bars").innerHTML = Object.entries(resources)
     .map(([resource, value]) => {
       const ratio = result.total_seconds ? Math.min(value / result.total_seconds, 1) : 0;
       return `
         <div class="resource-column">
-          <div class="resource-column-head"><span>${escapeHtml(floorLabel(resource))}</span><strong>${escapeHtml(formatDuration(value))}</strong></div>
-          <div class="resource-track" title="${escapeHtml(formatPercent(ratio))} of total if viewed independently"><i style="--bar-width:${ratio * 100}%;--bar-color:${FLOOR_COLORS[resource]}"></i></div>
+          <div class="resource-column-head"><span>${escapeHtml(certificateLabel(resource))}</span><strong>${escapeHtml(formatDuration(value))}</strong></div>
+          <div class="resource-track" title="Independent, overlapping certificate: ${escapeHtml(formatPercent(ratio))} of the latency lower bound"><i style="--bar-width:${ratio * 100}%;--bar-color:${FLOOR_COLORS[resource]}"></i></div>
         </div>`;
     })
     .join("");
+  $("#certificate-latency-total").textContent = formatDuration(result.total_seconds);
 }
 
 function collectRooflineData(result) {
@@ -951,7 +1240,14 @@ function renderRooflineChart() {
     const x = xScale(logX);
     const y = yScale(logY);
     const radius = 3.5 + 3.5 * Math.sqrt(point.count / maxCount);
-    drawRooflineMark(context, point, x, y, radius, colors[point.bottleneck]);
+    drawRooflineMark(
+      context,
+      point,
+      x,
+      y,
+      radius,
+      colors[point.bottleneck] || colors.strongText,
+    );
     state.rooflineHits.push({ x, y, radius: Math.max(radius, 7), point });
   }
   context.restore();
@@ -1011,17 +1307,51 @@ function renderRoofline() {
   const hardware = result.hardware;
   const expertParallelism = expertParallelismLabel(hardware);
   $("#roofline-summary").textContent =
-    `${phase} · TP${hardware.tp_size} · ${expertParallelism} · ${formatNumber(data.points.length)} grouped points`;
+    `${phase} · global TP${hardware.tp_size} · attention TP${hardware.attention_tp_size} · ${expertParallelism} · ${formatNumber(data.points.length)} grouped points`;
 
   const topologyRows = [
-    ["Tensor parallel", `TP${hardware.tp_size}`],
+    ["Global tensor parallel", `TP${hardware.tp_size}`],
+    ["Attention tensor parallel", `TP${hardware.attention_tp_size}`],
+    ["Attention data parallel", `DP${hardware.attention_dp_size}`],
     ["Expert parallel", expertParallelism],
     [
       "MoE sharding",
       hardware.moe_sharding === "ep" ? "Expert parallel" : "Tensor parallel",
     ],
     ["Routed experts / rank", formatNumber(hardware.local_routed_experts)],
+    ["MoE exchange", hardware.moe_a2a_backend || "No token A2A"],
+    ["Recipe status", hardware.recipe_status],
   ];
+  const ledger = result.parallel_work_ledger;
+  if (ledger) {
+    topologyRows.push(
+      ["DP real requests", ledger.dp_real_requests.join(", ")],
+      ["DP MLP-aligned rows", ledger.dp_mlp_aligned_rows.join(", ")],
+      ["DP execution rows", ledger.dp_model_rows.join(", ")],
+      [
+        "DP padding mode",
+        PADDING_MODE_LABELS[ledger.dp_padding_mode] || humanize(ledger.dp_padding_mode),
+      ],
+      ["Global MoE source rows", formatNumber(ledger.global_model_rows)],
+      ["Routed pair instances", formatNumber(ledger.routed_pair_instances)],
+      ["Critical sent pairs / source rank", formatNumber(ledger.critical_sent_pairs_per_source_rank)],
+      ["Balanced received pairs / EP rank", formatNumber(ledger.balanced_received_pairs_per_ep_rank)],
+      ["Scenario assumptions", ledger.bound_condition],
+      ["Topology contract", ledger.topology_contract],
+      [
+        "Excluded positive terms",
+        ledger.excluded_positive_term_ids
+          .map((term) => EXCLUDED_TERM_LABELS[term] || humanize(term))
+          .join(" · "),
+      ],
+    );
+  }
+  const sourceLinks = (hardware.sources || [])
+    .filter((source) => /^https?:\/\//.test(source.url || ""))
+    .map(
+      (source) => `<a href="${escapeHtml(source.url)}" target="_blank" rel="noreferrer">${escapeHtml(source.title)} ↗</a>`,
+    )
+    .join(" · ");
   $("#roofline-topology").innerHTML = topologyRows
     .map(
       ([label, value]) => `
@@ -1030,7 +1360,11 @@ function renderRoofline() {
           <strong>${escapeHtml(value)}</strong>
         </div>`,
     )
-    .join("");
+    .join("") + (sourceLinks ? `
+      <div class="roofline-topology-row">
+        <span>Recipe evidence</span>
+        <strong>${sourceLinks}</strong>
+      </div>` : "");
 
   $("#roofline-boundary-summary").innerHTML = ["compute", "hbm", "communication"]
     .map(
@@ -1278,7 +1612,7 @@ function calculationTrace(operation, layerIndex, operationIndex, expanded = fals
           <div class="calculation-trace-head">
             <div>
               <strong>Calculation trace</strong>
-              <span>Logical payload is separate from per-fabric link traffic; communication time sums the applicable fabric terms.</span>
+              <span>Logical payload is separate from per-fabric traffic; communication uses the maximum of topology-resolved independent fabric floors.</span>
             </div>
             <span class="calculation-count">${formatNumber(OPERATION_CALCULATION_FIELDS.length)} fields</span>
           </div>
@@ -1296,7 +1630,14 @@ function renderLayerTable() {
   const rows = [];
   result.layers.forEach((layer, index) => {
     const dominant = layer.operations.find((operation) => operation.id === layer.dominant_operation);
-    const haystack = [layer.name, layer.number, layer.attention, layer.ffn, dominant?.name, layer.limiting_floor]
+    const haystack = [
+      layer.name,
+      layer.number,
+      layer.attention,
+      layer.ffn,
+      dominant?.name,
+      ...layerCertificates(layer),
+    ]
       .join(" ")
       .toLowerCase();
     if (filter && !haystack.includes(filter)) return;
@@ -1305,7 +1646,6 @@ function renderLayerTable() {
     const pathClass = layer.attention || "other";
     const share = result.total_seconds ? layer.latency_seconds / result.total_seconds : 0;
     const barWidth = (layer.latency_seconds / maxLatency) * 100;
-    const floor = normalizeFloor(layer.limiting_floor);
     rows.push(`
       <tr class="layer-row" data-layer-index="${index}" data-layer-key="${escapeHtml(key)}" aria-expanded="${expanded}">
         <td class="expand-cell"><button class="expand-button" type="button" aria-expanded="${expanded}" aria-controls="ops-${index}" aria-label="${expanded ? "Collapse" : "Expand"} ${escapeHtml(layer.name)} operators">${expanded ? "×" : "+"}</button></td>
@@ -1314,12 +1654,12 @@ function renderLayerTable() {
         <td class="numeric">${escapeHtml(formatDuration(layer.latency_seconds))}</td>
         <td class="numeric share-cell"><span class="share-inline"><span class="micro-bar"><i style="--bar-width:${barWidth}%;--bar-color:${pathClass === "kda" ? "var(--accent)" : pathClass === "mla" ? "var(--purple)" : "var(--text-dim)"}"></i></span><span>${escapeHtml(formatPercent(share, 2))}</span></span></td>
         <td>${escapeHtml(dominant?.name || layer.dominant_operation)}</td>
-        <td><span class="resource-chip ${floor}">${escapeHtml(floorLabel(floor))}</span></td>
+        <td><span class="certificate-chips">${certificateChips(layer)}</span></td>
       </tr>`);
     if (expanded) rows.push(operationTable(layer, index, key));
   });
   $("#layer-table-body").innerHTML = rows.join("");
-  $("#layer-chart-summary").textContent = `${formatNumber(result.layers.length)} stages · ${formatDuration(result.total_seconds)} total`;
+  $("#layer-chart-summary").textContent = `${formatNumber(result.layers.length)} stages · ${formatDuration(result.total_seconds)} latency lower bound`;
 }
 
 function operationTable(layer, index, key) {
@@ -1365,7 +1705,7 @@ function operationTable(layer, index, key) {
           <div class="operation-head"><strong>${formatNumber(layer.operations.length)} operator rooflines</strong><span>Select an operator to inspect its math. Times can overlap; do not sum rows.</span></div>
           <div class="operation-table-scroll">
             <table class="data-table operation-table">
-              <thead><tr><th scope="col">Operator</th><th scope="col">Category</th><th scope="col" class="numeric">FLOPs / rank</th><th scope="col" class="numeric">HBM / rank</th><th scope="col" class="numeric">Logical collective</th><th scope="col" class="numeric">Compute floor</th><th scope="col" class="numeric">HBM floor</th><th scope="col" class="numeric">Comm floor</th><th scope="col" class="numeric">Op roofline</th><th scope="col">Bottleneck</th><th scope="col">Notes</th></tr></thead>
+              <thead><tr><th scope="col">Operator</th><th scope="col">Category</th><th scope="col" class="numeric">FLOPs / rank</th><th scope="col" class="numeric">HBM / rank</th><th scope="col" class="numeric">Collective payload</th><th scope="col" class="numeric">Compute floor</th><th scope="col" class="numeric">HBM floor</th><th scope="col" class="numeric">Comm floor</th><th scope="col" class="numeric">Op roofline</th><th scope="col">Bottleneck</th><th scope="col">Notes</th></tr></thead>
               <tbody>${rows}</tbody>
             </table>
           </div>
@@ -1499,7 +1839,7 @@ function renderLayerChart() {
   }
   canvas.setAttribute(
     "aria-label",
-    `${hardwareMeta(result).short} latency across ${result.layers.length} model stages. Peak stage ${formatDuration(Math.max(...values))}.`,
+    `${hardwareMeta(result).short} latency lower bounds across ${result.layers.length} model stages. Peak stage lower bound ${formatDuration(Math.max(...values))}.`,
   );
 }
 
@@ -1513,7 +1853,8 @@ function showChartTooltip(event) {
     tooltip.hidden = true;
     return;
   }
-  tooltip.innerHTML = `<strong>${escapeHtml(hit.layer.number == null ? humanize(hit.layer.name) : `Layer ${hit.layer.number} · ${layerPathLabel(hit.layer)}`)}</strong><span>${escapeHtml(formatDuration(hit.layer.latency_seconds))} · ${escapeHtml(floorLabel(hit.layer.limiting_floor))} floor</span>`;
+  const certificates = layerCertificates(hit.layer).map(certificateLabel).join(" + ");
+  tooltip.innerHTML = `<strong>${escapeHtml(hit.layer.number == null ? humanize(hit.layer.name) : `Layer ${hit.layer.number} · ${layerPathLabel(hit.layer)}`)}</strong><span>${escapeHtml(formatDuration(hit.layer.latency_seconds))} latency lower bound · ${escapeHtml(certificates)}</span>`;
   const left = Math.max(80, Math.min(rect.width - 80, hit.x + hit.width / 2));
   tooltip.style.left = `${left}px`;
   tooltip.style.top = `${Math.max(58, hit.y)}px`;
@@ -1530,8 +1871,13 @@ function renderMemory() {
   $("#memory-total").textContent = formatBytes(total);
   $("#memory-capacity").textContent = `${formatBytes(capacity)} nominal`;
   const fit = $("#memory-fit");
-  fit.className = `fit-badge ${memory.fits_nominal_capacity ? "fits" : "over"}`;
-  fit.textContent = memory.fits_nominal_capacity ? `${formatPercent(ratio)} · fits nominal` : `${formatPercent(ratio)} · over nominal`;
+  const fits = memory.fits_nominal_capacity;
+  fit.className = `fit-badge ${fits === true ? "fits" : fits === false ? "over" : "unknown"}`;
+  fit.textContent = fits === true
+    ? `${formatPercent(ratio)} · accounted peak fits nominal`
+    : fits === false
+      ? `${formatPercent(ratio)} · accounted lower bound exceeds nominal`
+      : `${formatPercent(ratio)} · fit inconclusive; MegaMoE workspace excluded`;
   const bar = $("#capacity-bar");
   bar.classList.toggle("over", ratio > 1);
   bar.style.setProperty("--capacity-width", `${Math.min(ratio * 100, 100)}%`);
@@ -1625,8 +1971,9 @@ function bindEvents() {
       scheduleCalculate();
     }),
   );
-  $$('input[name="tp-size"]').forEach((input) =>
+  $$('input[name="sharding"]').forEach((input) =>
     input.addEventListener("change", () => {
+      updateShardingCompatibility();
       updateSequenceLimit();
       scheduleCalculate();
     }),
@@ -1711,4 +2058,8 @@ async function init() {
   if (connected) calculate();
 }
 
-document.addEventListener("DOMContentLoaded", init);
+if (typeof module === "object" && module.exports) {
+  module.exports = { normalizeFloor, validateCalculatorResponse };
+} else {
+  document.addEventListener("DOMContentLoaded", init);
+}

@@ -2,10 +2,10 @@
 
 The estimator counts the operations selected by the scoped SGLang recipes and
 then schedules their known dependencies.  It does not claim to predict real
-latency: default efficiencies are 100%, collective startup is zero, HBM traffic
-is a logical lower bound, and routing is uniform.  Those assumptions make the
-result an optimistic bound that can later be calibrated without changing the
-operation inventory.
+latency: efficiencies are fixed at 100%, collective startup is excluded, and
+HBM-demand certificates are conditional on counted logical reads and writes
+materializing through HBM.  Those conditions keep the accounting explicit
+without presenting it as a benchmark result.
 """
 
 from __future__ import annotations
@@ -25,9 +25,10 @@ from .specs import (
 
 Phase = Literal["prefill", "decode"]
 ComputeKind = Literal["bf16", "k3_expert", "none"]
-CollectiveKind = Literal["all_reduce", "all_gather"]
+CollectiveKind = Literal["all_reduce", "all_gather", "reduce_scatter", "all_to_all"]
 
 BF16_BYTES = 2
+FP8_BYTES = 1
 FP32_BYTES = 4
 
 
@@ -119,6 +120,43 @@ class Workload:
 
 
 @dataclass(frozen=True)
+class ParallelWorkLedger:
+    """Per-rank work identities for the Blackwell DP-attention/EP recipe."""
+
+    attention_tp_size: int
+    attention_dp_size: int
+    dp_real_requests: tuple[int, ...]
+    dp_mlp_aligned_rows: tuple[int, ...]
+    dp_model_rows: tuple[int, ...]
+    dp_padding_mode: str
+    source_rows_per_attention_rank: tuple[int, ...]
+    critical_attention_rows: int
+    critical_model_rows: int
+    global_model_rows: int
+    routed_pair_instances: int
+    sent_pairs_per_attention_rank_by_dp: tuple[int, ...]
+    critical_sent_pairs_per_source_rank: int
+    balanced_received_pairs_per_ep_rank: int
+    bound_condition_id: str
+    bound_condition: str
+    topology_contract: str
+    excluded_positive_term_ids: tuple[str, ...]
+    notes: tuple[str, ...]
+
+    @property
+    def critical_source_rows_per_rank(self) -> int:
+        return max(self.source_rows_per_attention_rank, default=0)
+
+    def to_dict(self) -> dict:
+        result = asdict(self)
+        result["contract_id"] = "kimi_k3_blackwell_parallel_ledger_v1"
+        result["critical_source_rows_per_rank"] = (
+            self.critical_source_rows_per_rank
+        )
+        return result
+
+
+@dataclass(frozen=True)
 class EstimatorAssumptions:
     compute_efficiency: float = 1.0
     hbm_efficiency: float = 1.0
@@ -141,6 +179,18 @@ class EstimatorAssumptions:
             raise ValueError("collective_startup_seconds cannot be negative.")
         if self.mla_kv_read_amplification < 1:
             raise ValueError("mla_kv_read_amplification must be at least 1.")
+        certificate_values = (
+            self.compute_efficiency,
+            self.hbm_efficiency,
+            self.collective_efficiency,
+            self.collective_startup_seconds,
+            self.mla_kv_read_amplification,
+        )
+        if certificate_values != (1.0, 1.0, 1.0, 0.0, 1.0):
+            raise ValueError(
+                "Lower-bound certificates require unit efficiencies, zero "
+                "collective startup, and unit MLA KV read amplification."
+            )
 
 
 _DEFAULT_ESTIMATOR_ASSUMPTIONS = EstimatorAssumptions()
@@ -230,7 +280,7 @@ class LayerEstimate:
     hbm_resource_seconds: float
     communication_resource_seconds: float
     latency_seconds: float
-    limiting_floor: str
+    limiting_certificates: tuple[str, ...]
 
     @property
     def dominant_operation(self) -> OperationEstimate:
@@ -242,12 +292,12 @@ class LayerEstimate:
             "number": self.number,
             "attention": self.attention,
             "ffn": self.ffn,
-            "dependency_path_seconds": self.dependency_path_seconds,
+            "critical_path_lower_bound_seconds": self.dependency_path_seconds,
             "compute_resource_seconds": self.compute_resource_seconds,
             "hbm_resource_seconds": self.hbm_resource_seconds,
             "communication_resource_seconds": self.communication_resource_seconds,
             "latency_seconds": self.latency_seconds,
-            "limiting_floor": self.limiting_floor,
+            "limiting_certificates": list(self.limiting_certificates),
             "dominant_operation": self.dominant_operation.id,
             "operations": [op.to_dict() for op in self.operations],
         }
@@ -262,7 +312,8 @@ class MemoryEstimate:
     attention_residual_bank_bytes_per_rank: float
     total_accounted_peak_bytes_per_rank: float
     nominal_hbm_capacity_bytes_per_rank: float
-    fits_nominal_capacity: bool
+    fits_nominal_capacity: bool | None
+    capacity_status: str
     weight_breakdown_bytes_per_rank: dict[str, float]
 
     def to_dict(self) -> dict:
@@ -277,6 +328,7 @@ class EstimateResult:
     workload: Workload
     assumptions: EstimatorAssumptions
     decode_cuda_graph_replay: bool
+    parallel_work_ledger: ParallelWorkLedger | None
     layers: tuple[LayerEstimate, ...]
     total_seconds: float
     memory: MemoryEstimate
@@ -294,6 +346,11 @@ class EstimateResult:
             "workload": self.workload.to_dict(),
             "assumptions": asdict(self.assumptions),
             "decode_cuda_graph_replay": self.decode_cuda_graph_replay,
+            "parallel_work_ledger": (
+                self.parallel_work_ledger.to_dict()
+                if self.parallel_work_ledger is not None
+                else None
+            ),
             "total_seconds": self.total_seconds,
             "ideal_tokens_per_second": self.ideal_tokens_per_second,
             "memory": self.memory.to_dict(),
@@ -316,6 +373,8 @@ class _PendingOperation:
     compute_seconds: float
     hbm_seconds: float
     communication_seconds: float
+    communication_local_seconds: float
+    communication_remote_seconds: float
     notes: tuple[str, ...]
     calculations: dict[str, CalculationProvenance]
 
@@ -323,8 +382,8 @@ class _PendingOperation:
 _CALCULATION_LABELS = {
     "flops_per_rank": "FLOPs per rank",
     "hbm_bytes_per_rank": "HBM bytes per rank",
-    "logical_collective_bytes": "Logical collective bytes",
-    "link_bytes_per_rank": "Link bytes per rank",
+    "logical_collective_bytes": "Logical collective payload",
+    "link_bytes_per_rank": "Fabric-byte diagnostic",
     "compute_seconds": "Compute floor",
     "hbm_seconds": "HBM floor",
     "communication_seconds": "Communication floor",
@@ -506,6 +565,8 @@ class _LayerBuilder:
                 compute_seconds=compute_seconds,
                 hbm_seconds=hbm_seconds,
                 communication_seconds=0,
+                communication_local_seconds=0,
+                communication_remote_seconds=0,
                 notes=tuple(notes),
                 calculations=calculations,
             )
@@ -571,6 +632,10 @@ class _LayerBuilder:
         logical_bytes: float,
         logical_bytes_formula: str,
         logical_bytes_substitution: str,
+        group_size: int | None = None,
+        local_domain_size: int | None = None,
+        intra_link_bytes_per_rank: float | None = None,
+        inter_link_bytes_per_rank: float | None = None,
         dependencies: Sequence[str] = (),
         flops: float = 0,
         hbm_bytes: float | None = None,
@@ -588,6 +653,10 @@ class _LayerBuilder:
             kind=kind,
             logical_bytes=logical_bytes,
             assumptions=self.assumptions,
+            group_size=group_size,
+            local_domain_size=local_domain_size,
+            intra_link_bytes_per_rank=intra_link_bytes_per_rank,
+            inter_link_bytes_per_rank=inter_link_bytes_per_rank,
         )
         communication_seconds = collective.seconds
         link_bytes = collective.link_bytes_per_rank
@@ -596,25 +665,28 @@ class _LayerBuilder:
             flops / (peak * self.assumptions.compute_efficiency) if flops else 0.0
         )
         if hbm_bytes is None:
+            if kind == "all_to_all":
+                raise ValueError(f"{op_id} must provide explicit fused A2A HBM bytes.")
             # Logical device-memory floor: all-reduce reads and overwrites a
-            # full local tensor; all-gather reads a local shard and writes the
-            # full gathered tensor. Backend algorithms can move more.
+            # full local tensor; gather/scatter reads one side and writes the
+            # other. Backend algorithms can move more.
+            collective_size = group_size or self.hardware.tp_size
             hbm_bytes = (
                 2 * logical_bytes
                 if kind == "all_reduce"
-                else logical_bytes * (1 + 1 / self.hardware.tp_size)
+                else logical_bytes * (1 + 1 / collective_size)
             )
             hbm_formula = (
                 "2 × logical collective bytes"
                 if kind == "all_reduce"
-                else "logical collective bytes × (1 + 1 / TP)"
+                else "logical collective bytes × (1 + 1 / collective group size)"
             )
             hbm_substitution = (
                 f"2 × {_display_number(logical_bytes)}"
                 if kind == "all_reduce"
                 else (
                     f"{_display_number(logical_bytes)} × "
-                    f"(1 + 1 / {_display_number(self.hardware.tp_size)})"
+                    f"(1 + 1 / {_display_number(collective_size)})"
                 )
             )
         elif hbm_bytes and (not hbm_formula or not hbm_substitution):
@@ -646,13 +718,25 @@ class _LayerBuilder:
                 formula=logical_bytes_formula,
                 substitution=logical_bytes_substitution,
                 result=logical_bytes,
-                note="Full logical tensor size after the collective, before topology expansion.",
+                note=(
+                    "One-rank logical send/receive payload before locality; the "
+                    "communication floor uses topology-resolved fabric bytes."
+                    if kind == "all_to_all"
+                    else "Full logical tensor size after the collective, before topology expansion."
+                ),
             ),
             "link_bytes_per_rank": _calculation(
                 "link_bytes_per_rank",
                 formula=collective.link_formula,
                 substitution=collective.link_substitution,
                 result=link_bytes,
+                note=(
+                    "Sum of independent local- and remote-fabric directional "
+                    "maxima; it is a non-additive diagnostic and need not belong "
+                    "to one physical rank."
+                    if kind == "all_to_all"
+                    else None
+                ),
             ),
             "compute_seconds": _calculation(
                 "compute_seconds",
@@ -707,6 +791,8 @@ class _LayerBuilder:
                 compute_seconds=compute_seconds,
                 hbm_seconds=hbm_seconds,
                 communication_seconds=communication_seconds,
+                communication_local_seconds=collective.local_seconds,
+                communication_remote_seconds=collective.remote_seconds,
                 notes=tuple(notes) + (collective.note,),
                 calculations=calculations,
             )
@@ -775,15 +861,21 @@ class _LayerBuilder:
         # conservation floors, then take the maximum with the dependency path.
         compute_resource = sum(op.compute_seconds for op in result)
         hbm_resource = sum(op.hbm_seconds for op in result)
-        communication_resource = sum(op.communication_seconds for op in result)
-        limiting_floor, latency = max(
-            (
-                ("dependency", dependency_path),
-                ("compute_resource", compute_resource),
-                ("hbm_resource", hbm_resource),
-                ("communication_resource", communication_resource),
-            ),
-            key=lambda item: item[1],
+        communication_resource = max(
+            sum(op.communication_local_seconds for op in self._operations),
+            sum(op.communication_remote_seconds for op in self._operations),
+        )
+        certificates = (
+            ("critical_path", dependency_path),
+            ("compute", compute_resource),
+            ("hbm", hbm_resource),
+            ("communication", communication_resource),
+        )
+        latency = max(value for _, value in certificates)
+        # Co-limiting means exact equality of the derived lower bounds. Do not
+        # turn merely close values into a semantic tie with a display tolerance.
+        limiting_certificates = tuple(
+            name for name, value in certificates if value == latency
         )
         return LayerEstimate(
             name=self.name,
@@ -796,13 +888,15 @@ class _LayerBuilder:
             hbm_resource_seconds=hbm_resource,
             communication_resource_seconds=communication_resource,
             latency_seconds=latency,
-            limiting_floor=limiting_floor,
+            limiting_certificates=limiting_certificates,
         )
 
 
 @dataclass(frozen=True)
 class _CollectiveCost:
     seconds: float
+    local_seconds: float
+    remote_seconds: float
     link_bytes_per_rank: float
     note: str
     link_formula: str
@@ -817,54 +911,115 @@ def _collective_cost(
     kind: CollectiveKind,
     logical_bytes: float,
     assumptions: EstimatorAssumptions,
+    group_size: int | None = None,
+    local_domain_size: int | None = None,
+    intra_link_bytes_per_rank: float | None = None,
+    inter_link_bytes_per_rank: float | None = None,
 ) -> _CollectiveCost:
     """Return idealized per-rank collective time and link traffic.
 
-    ``logical_bytes`` is the full tensor size after the operation, not a local
-    shard size.  NVLink numbers are one-directional; vendor bidirectional
-    marketing numbers were halved in the hardware specs.
+    For reductions and gathers, ``logical_bytes`` is the full logical tensor.
+    A2A callers provide topology-resolved critical directional bytes for each
+    fabric. NVLink and scale-out rates are one-directional.
     """
 
-    p = hardware.tp_size
+    p = group_size or hardware.tp_size
+    if p <= 0:
+        raise ValueError("Collective group size must be positive.")
+    local_p = min(local_domain_size or hardware.nvlink_domain_size, p)
+    if p % local_p:
+        raise ValueError("Collective group must contain whole local domains.")
     efficiency = assumptions.collective_efficiency
     alpha = assumptions.collective_startup_seconds
-    if p > hardware.nvlink_domain_size:
-        # Explicit two-level lower bound: reduce-scatter/all-gather within each
-        # NVLink domain, then exchange corresponding rank shards over the
-        # per-GPU scale-out fabric. This is a model, not a claim about the exact
-        # NCCL algorithm selected at runtime.
-        local_p = hardware.nvlink_domain_size
-        domains = p // local_p
-        nv_bw = hardware.nvlink_bytes_per_s_per_direction * efficiency
+    nv_bw = hardware.nvlink_bytes_per_s_per_direction * efficiency
+
+    if kind == "all_to_all":
+        if intra_link_bytes_per_rank is None or inter_link_bytes_per_rank is None:
+            raise ValueError("A2A requires topology-resolved directional bytes.")
+        intra_bytes = intra_link_bytes_per_rank
+        inter_bytes = inter_link_bytes_per_rank
         net_raw = hardware.scaleout_bytes_per_s_per_gpu_per_direction
-        assert net_raw is not None
+        if inter_bytes and net_raw is None:
+            raise ValueError("Cross-domain A2A requires a scale-out fabric.")
+        local_seconds = intra_bytes / nv_bw
+        remote_seconds = (
+            inter_bytes / (net_raw * efficiency)
+            if inter_bytes and net_raw is not None
+            else 0.0
+        )
+        seconds = max(local_seconds, remote_seconds) + (alpha if p > 1 else 0.0)
+        return _CollectiveCost(
+            seconds=seconds,
+            local_seconds=local_seconds,
+            remote_seconds=remote_seconds,
+            link_bytes_per_rank=intra_bytes + inter_bytes,
+            note=(
+                "Domain-resolved ideal-balanced A2A; independent NVLink and "
+                "scale-out resource floors overlap."
+            ),
+            link_formula="critical local directional bytes + critical remote directional bytes",
+            link_substitution=(
+                f"{_display_number(intra_bytes)} + {_display_number(inter_bytes)}"
+            ),
+            communication_formula=(
+                "max(local-link bytes / NVLink rate, remote bytes / scale-out "
+                "rate) + startup"
+                if inter_bytes
+                else "local-link bytes / NVLink rate + startup"
+            ),
+            communication_substitution=(
+                f"max({_display_number(intra_bytes)} / "
+                f"({_display_number(hardware.nvlink_bytes_per_s_per_direction)} × "
+                f"{_display_number(efficiency)}), {_display_number(inter_bytes)} / "
+                f"({_display_number(net_raw)} × {_display_number(efficiency)})) + "
+                f"{_display_number(alpha)}"
+                if inter_bytes and net_raw is not None
+                else (
+                    f"{_display_number(intra_bytes)} / "
+                    f"({_display_number(hardware.nvlink_bytes_per_s_per_direction)} × "
+                    f"{_display_number(efficiency)}) + {_display_number(alpha)}"
+                )
+            ),
+        )
+
+    if p > local_p:
+        # Explicit two-level resource floor. Chunked implementations may
+        # pipeline the local and scale-out legs, so time is their maximum,
+        # not their sum; this does not claim an exact NCCL algorithm.
+        domains = p // local_p
+        net_raw = hardware.scaleout_bytes_per_s_per_gpu_per_direction
+        if net_raw is None:
+            raise ValueError("Cross-domain collective requires a scale-out fabric.")
         net_bw = net_raw * efficiency
         if kind == "all_reduce":
-            intra_bytes = 2 * (local_p - 1) / local_p * logical_bytes
-            inter_bytes = 2 * (domains - 1) / domains * logical_bytes / local_p
-            seconds = intra_bytes / nv_bw + inter_bytes / net_bw + alpha
+            # Each rank must recover one full-tensor aggregate not present in
+            # its input.  Under this explicit two-level contract, that is one
+            # full tensor on the local fabric and one local shard on scale-out.
+            intra_bytes = logical_bytes
+            inter_bytes = logical_bytes / local_p
             note = (
-                f"Hierarchical {local_p}-GPU NVLink reduce-scatter/all-gather "
-                f"plus a {domains}-domain scale-out shard all-reduce."
+                "Two-level all-reduce information floor across "
+                f"{domains} domains and {local_p} local ranks."
             )
             link_formula = (
-                "2 × (local ranks − 1) / local ranks × logical bytes + "
-                "2 × (domains − 1) / domains × logical bytes / local ranks"
+                "logical bytes + logical bytes / local ranks"
             )
             link_substitution = (
-                f"2 × ({local_p} − 1) / {local_p} × {_display_number(logical_bytes)} "
-                f"+ 2 × ({domains} − 1) / {domains} × "
+                f"{_display_number(logical_bytes)} + "
                 f"{_display_number(logical_bytes)} / {local_p}"
             )
         else:
             # Gather corresponding rank shards across domains first, then
-            # gather the larger shards within each local NVLink domain.
+            # gather the larger shards within each local NVLink domain. The
+            # byte floor is the same for reduce-scatter in reverse.
             inter_bytes = (domains - 1) / domains * logical_bytes / local_p
             intra_bytes = (local_p - 1) / local_p * logical_bytes
-            seconds = intra_bytes / nv_bw + inter_bytes / net_bw + alpha
+            collective_name = (
+                "reduce-scatter" if kind == "reduce_scatter" else "all-gather"
+            )
             note = (
-                f"Scale-out all-gather across {domains} corresponding rank "
-                f"shards followed by a {local_p}-GPU NVLink all-gather."
+                f"Hierarchical {collective_name} across {domains} domains and "
+                f"{local_p} local ranks."
             )
             link_formula = (
                 "(local ranks − 1) / local ranks × logical bytes + "
@@ -875,38 +1030,54 @@ def _collective_cost(
                 f"+ ({domains} − 1) / {domains} × "
                 f"{_display_number(logical_bytes)} / {local_p}"
             )
+        seconds = max(intra_bytes / nv_bw, inter_bytes / net_bw) + alpha
+        local_seconds = intra_bytes / nv_bw
+        remote_seconds = inter_bytes / net_bw
         return _CollectiveCost(
             seconds=seconds,
+            local_seconds=local_seconds,
+            remote_seconds=remote_seconds,
             link_bytes_per_rank=intra_bytes + inter_bytes,
             note=note,
             link_formula=link_formula,
             link_substitution=link_substitution,
             communication_formula=(
-                "intra-domain bytes / (NVLink bytes/s × collective efficiency) + "
-                "inter-domain bytes / (scale-out bytes/s × collective efficiency) + startup"
+                "max(intra-domain bytes / (NVLink bytes/s × collective efficiency), "
+                "inter-domain bytes / (scale-out bytes/s × collective efficiency)) + startup"
             ),
             communication_substitution=(
-                f"{_display_number(intra_bytes)} / "
+                f"max({_display_number(intra_bytes)} / "
                 f"({_display_number(hardware.nvlink_bytes_per_s_per_direction)} × "
-                f"{_display_number(efficiency)}) + {_display_number(inter_bytes)} / "
-                f"({_display_number(net_raw)} × {_display_number(efficiency)}) + "
+                f"{_display_number(efficiency)}), {_display_number(inter_bytes)} / "
+                f"({_display_number(net_raw)} × {_display_number(efficiency)})) + "
                 f"{_display_number(alpha)}"
             ),
         )
 
-    nv_bw = hardware.nvlink_bytes_per_s_per_direction * efficiency
     if kind == "all_reduce":
-        link_bytes = 2 * (p - 1) / p * logical_bytes
-        note = "Ideal ring all-reduce inside one nonblocking NVLink domain."
-        link_formula = "2 × (TP − 1) / TP × logical bytes"
-        link_substitution = f"2 × ({p} − 1) / {p} × {_display_number(logical_bytes)}"
+        link_bytes = logical_bytes if p > 1 else 0.0
+        note = (
+            "All-reduce receive-information floor inside one "
+            "nonblocking NVLink domain."
+        )
+        link_formula = "logical bytes if group ranks > 1, otherwise 0"
+        link_substitution = (
+            _display_number(logical_bytes) if p > 1 else "0 (single rank)"
+        )
     else:
         link_bytes = (p - 1) / p * logical_bytes
-        note = "Ideal ring all-gather inside one nonblocking NVLink domain."
-        link_formula = "(TP − 1) / TP × logical bytes"
+        collective_name = (
+            "reduce-scatter" if kind == "reduce_scatter" else "all-gather"
+        )
+        note = (
+            f"Ideal ring {collective_name} inside one nonblocking NVLink domain."
+        )
+        link_formula = "(group ranks − 1) / group ranks × logical bytes"
         link_substitution = f"({p} − 1) / {p} × {_display_number(logical_bytes)}"
     return _CollectiveCost(
         seconds=link_bytes / nv_bw + alpha,
+        local_seconds=link_bytes / nv_bw,
+        remote_seconds=0,
         link_bytes_per_rank=link_bytes,
         note=note,
         link_formula=link_formula,
@@ -934,29 +1105,18 @@ def _residual_aggregate(
     final_output: bool = False,
 ) -> str:
     h200_unfused = builder.hardware.family == "h200"
+    # Count only one compulsory arithmetic operation per output element. The
+    # larger logical score/norm estimate is intentionally excluded because it
+    # is not an instruction-count lower bound for every fused implementation.
+    flops = token_count * hidden_size
+    flops_formula = "tokens × hidden size compulsory output operations"
+    flops_substitution = f"{token_count} × {hidden_size}"
     if previous_blocks == 0:
-        flops = 5.0 * token_count * hidden_size
         hbm_bytes = token_count * hidden_size * 2 * BF16_BYTES
-        flops_formula = "5 × tokens × hidden size"
-        flops_substitution = f"5 × {token_count} × {hidden_size}"
         hbm_formula = "tokens × hidden size × 2 passes × BF16 bytes"
         hbm_substitution = f"{token_count} × {hidden_size} × 2 × {BF16_BYTES}"
     else:
         rows = previous_blocks + 1
-        # Derived logical work: score RMSNorm+dot, short softmax, weighted
-        # combination, and output RMSNorm.  This is intentionally not presented
-        # as an exact instruction count for the fused TMA/Triton kernels.
-        flops = token_count * (
-            rows * 7 * hidden_size + rows * 5 + 2 * rows * hidden_size + 5 * hidden_size
-        )
-        flops_formula = (
-            "tokens × (rows × 7 × hidden size + rows × 5 + "
-            "2 × rows × hidden size + 5 × hidden size)"
-        )
-        flops_substitution = (
-            f"{token_count} × ({rows} × 7 × {hidden_size} + {rows} × 5 + "
-            f"2 × {rows} × {hidden_size} + 5 × {hidden_size})"
-        )
         # Lower-bound traffic reads each candidate row in score and combine
         # passes, then writes the normalized result.
         hbm_bytes = (
@@ -1015,7 +1175,8 @@ def _residual_aggregate(
                 if h200_unfused
                 else "Blackwell counts the fused SM100+ TMA aggregation kernel."
             ),
-            "FLOPs and HBM traffic remain derived logical counts, not measured transactions.",
+            "Compute counts only one compulsory output operation per element; score, softmax, and normalization arithmetic are excluded.",
+            "HBM traffic is a logical materialization condition, not measured transactions.",
         ),
     )
 
@@ -1027,43 +1188,76 @@ def _attention_all_reduce(
     token_count: int,
     hidden_size: int,
     fuse_pending_prefix: bool,
+    reduce_scatter: bool = False,
 ) -> str:
     logical_bytes = token_count * hidden_size * BF16_BYTES
+    group_size = builder.hardware.attention_tp_size
+    output_tokens = token_count // group_size if reduce_scatter else token_count
+    if reduce_scatter and token_count % group_size:
+        raise ValueError("SP-MoE reduce-scatter rows must divide attention TP.")
+    fusion_note = (
+        "SP lower-bound bundle consumes the pending BF16 prefix in the "
+        "reduce-scatter epilogue; GB300 custom SP implements this, while other "
+        "paths may materialize more work."
+        if reduce_scatter
+        else "K3 fused AR consumes the pending BF16 prefix in its epilogue."
+    )
     return builder.add_collective(
-        op_id="attention_all_reduce",
+        op_id=("attention_reduce_scatter" if reduce_scatter else "attention_all_reduce"),
         name=(
-            "Attention output TP all-reduce + fused pending-prefix add"
-            if fuse_pending_prefix
-            else "Attention output TP all-reduce"
+            "Attention output TP reduce-scatter for SP-MoE"
+            if reduce_scatter and not fuse_pending_prefix
+            else (
+                "Attention output TP reduce-scatter + fused pending-prefix add"
+                if reduce_scatter
+                else (
+                    "Attention output TP all-reduce + fused pending-prefix add"
+                    if fuse_pending_prefix
+                    else "Attention output TP all-reduce"
+                )
+            )
         ),
         category="communication",
-        kind="all_reduce",
+        kind="reduce_scatter" if reduce_scatter else "all_reduce",
         logical_bytes=logical_bytes,
         logical_bytes_formula="tokens × hidden size × BF16 bytes",
         logical_bytes_substitution=(f"{token_count} × {hidden_size} × {BF16_BYTES}"),
+        group_size=group_size,
         dependencies=(dependency,),
-        flops=token_count * hidden_size if fuse_pending_prefix else 0,
-        hbm_bytes=3 * logical_bytes if fuse_pending_prefix else None,
+        flops=output_tokens * hidden_size if fuse_pending_prefix else 0,
+        hbm_bytes=(
+            logical_bytes * (1 + 2 / group_size)
+            if fuse_pending_prefix and reduce_scatter
+            else (3 * logical_bytes if fuse_pending_prefix else None)
+        ),
         compute_kind="bf16" if fuse_pending_prefix else "none",
         flops_formula=(
-            "tokens × hidden size (fused prefix add)" if fuse_pending_prefix else None
+            (
+                "output-shard tokens × hidden size (fused prefix add)"
+                if reduce_scatter
+                else "tokens × hidden size (fused prefix add)"
+            )
+            if fuse_pending_prefix
+            else None
         ),
         flops_substitution=(
-            f"{token_count} × {hidden_size}" if fuse_pending_prefix else None
+            f"{output_tokens} × {hidden_size}" if fuse_pending_prefix else None
         ),
         hbm_formula=(
-            "3 × logical collective bytes (output, prefix, and result)"
+            "logical input bytes + 2 × reduce-scatter output-shard bytes"
+            if fuse_pending_prefix and reduce_scatter
+            else "3 × logical collective bytes (output, prefix, and result)"
             if fuse_pending_prefix
             else None
         ),
         hbm_substitution=(
-            f"3 × {_display_number(logical_bytes)}" if fuse_pending_prefix else None
-        ),
-        notes=(
-            ("K3 fused AR consumes the pending BF16 prefix in its epilogue.",)
+            f"{_display_number(logical_bytes)} × (1 + 2 / {group_size})"
+            if fuse_pending_prefix and reduce_scatter
+            else f"3 × {_display_number(logical_bytes)}"
             if fuse_pending_prefix
-            else ()
+            else None
         ),
+        notes=(fusion_note,) if fuse_pending_prefix else (),
     )
 
 
@@ -1076,9 +1270,11 @@ def _kda_attention(
     hardware: HardwareSpec,
     assumptions: EstimatorAssumptions,
     fuse_pending_prefix: bool,
+    collective_token_count: int | None = None,
+    reduce_scatter: bool = False,
 ) -> str:
     tokens = workload.token_count
-    tp = hardware.tp_size
+    tp = hardware.attention_tp_size
     heads = hardware.local_attention_heads
     projection = config.projection_size
 
@@ -1137,28 +1333,24 @@ def _kda_attention(
     # CUDA-graph padding executes dummy KDA rows too, including their state and
     # convolution-state traffic. Persistent capacity below still uses real B.
     state_sequences = workload.model_batch_size
-    if workload.phase == "prefill":
-        recurrence_flops = tokens * heads * (4 * k * v + 2 * k * k)
-        recurrence_formula = "tokens × local heads × (4 × K × V + 2 × K²)"
-        recurrence_substitution = (
-            f"{tokens} × {heads} × (4 × {k} × {v} + 2 × {k} × {k})"
-        )
-        recurrence_note = (
-            "KDA prefill FLOPs follow SGLang's benchmark approximation: "
-            "4*K*V plus 2*K*K per token/head; inverse/scalar work is omitted."
-        )
-    else:
-        recurrence_flops = tokens * heads * 7 * k * v
-        recurrence_formula = "tokens × local heads × 7 × K × V"
-        recurrence_substitution = f"{tokens} × {heads} × 7 × {k} × {v}"
-        recurrence_note = (
-            "KDA decode counts two state-vector products, state decay, and the "
-            "rank-1 state update: approximately 7*K*V per token/head."
-        )
+    recurrence_flops = tokens * heads * k * v
+    recurrence_formula = "tokens × local heads × K × V compulsory state operations"
+    recurrence_substitution = f"{tokens} × {heads} × {k} × {v}"
+    recurrence_note = (
+        "The compute certificate counts only one compulsory arithmetic operation "
+        "per dense K×V state element; benchmark approximation coefficients are excluded."
+    )
     activation_bytes = tokens * heads * (3 * k + v) * BF16_BYTES
     gate_bytes = tokens * heads * k * FP32_BYTES
     beta_bytes = tokens * heads * FP32_BYTES
-    state_bytes = 2 * state_sequences * heads * k * v * FP32_BYTES
+    state_bytes = (
+        2
+        * state_sequences
+        * heads
+        * k
+        * v
+        * hardware.kda_state_bytes_per_element
+    )
     conv_state_bytes = (
         2
         * state_sequences
@@ -1210,7 +1402,7 @@ def _kda_attention(
             notes=(
                 recurrence_note,
                 "TP8 uses SGLang's shape-gated fused KDA decode kernel.",
-                "State traffic assumes one FP32 KDA state read and write per sequence.",
+                "State traffic assumes one recipe-dtype KDA state read and write per sequence.",
             ),
         )
     else:
@@ -1268,7 +1460,7 @@ def _kda_attention(
             ),
             notes=(
                 recurrence_note,
-                "State traffic assumes one FP32 KDA state read and write per sequence.",
+                "State traffic assumes one recipe-dtype KDA state read and write per sequence.",
                 "The prefill recurrence is itself multi-kernel; its internal workspace traffic is not known here.",
             ),
         )
@@ -1297,9 +1489,10 @@ def _kda_attention(
     return _attention_all_reduce(
         builder,
         dependency=o_proj,
-        token_count=tokens,
+        token_count=collective_token_count or tokens,
         hidden_size=config.hidden_size,
         fuse_pending_prefix=fuse_pending_prefix,
+        reduce_scatter=reduce_scatter,
     )
 
 
@@ -1312,12 +1505,15 @@ def _mla_attention(
     hardware: HardwareSpec,
     assumptions: EstimatorAssumptions,
     fuse_pending_prefix: bool,
+    collective_token_count: int | None = None,
+    reduce_scatter: bool = False,
 ) -> str:
     tokens = workload.token_count
     local_heads = hardware.local_attention_heads
     a_out = config.q_lora_rank + config.kv_lora_rank + config.qk_rope_head_dim
     overlap_limit = hardware.decode_overlap_token_limit
     overlap_output_gate = False
+    kv_cache_bytes = hardware.kv_cache_bytes_per_element
 
     a_proj = builder.add_gemm(
         op_id="mla_a_proj",
@@ -1388,7 +1584,7 @@ def _mla_attention(
             * (config.mla_qk_head_dim + config.v_head_dim)
             * BF16_BYTES
         )
-        cache_write = tokens * config.mla_latent_cache_dim * BF16_BYTES
+        cache_write = tokens * config.mla_latent_cache_dim * kv_cache_bytes
         core = builder.add_roofline(
             op_id="mla_mha_core",
             name="Causal MHA core for cold prefill",
@@ -1408,7 +1604,7 @@ def _mla_attention(
             hbm_substitution=(
                 f"{tokens} × {local_heads} × 2 × "
                 f"({config.mla_qk_head_dim} + {config.v_head_dim}) × {BF16_BYTES} "
-                f"+ {tokens} × {config.mla_latent_cache_dim} × {BF16_BYTES}"
+                f"+ {tokens} × {config.mla_latent_cache_dim} × {kv_cache_bytes}"
             ),
             notes=(
                 "HBM bytes are a FlashAttention-style logical minimum: Q/K/V/O plus latent-cache write once.",
@@ -1441,7 +1637,7 @@ def _mla_attention(
             workload.batch_size
             * workload.context_length
             * config.mla_latent_cache_dim
-            * BF16_BYTES
+            * kv_cache_bytes
             * assumptions.mla_kv_read_amplification
         )
         query_output_bytes = (
@@ -1450,7 +1646,7 @@ def _mla_attention(
             * (config.mla_latent_cache_dim + config.kv_lora_rank)
             * BF16_BYTES
         )
-        cache_write = tokens * config.mla_latent_cache_dim * BF16_BYTES
+        cache_write = tokens * config.mla_latent_cache_dim * kv_cache_bytes
         core = builder.add_roofline(
             op_id="mla_absorbed_core",
             name="Absorbed MLA decode attention core",
@@ -1468,17 +1664,17 @@ def _mla_attention(
                 f"({config.mla_latent_cache_dim} + {config.kv_lora_rank})"
             ),
             hbm_formula=(
-                "real batch × context × latent-cache width × BF16 bytes × read "
+                "real batch × context × latent-cache width × cache-element bytes × read "
                 "amplification + padded tokens × local heads × (latent-cache width + "
-                "kv LoRA rank) × BF16 bytes + padded tokens × latent-cache width × BF16 bytes"
+                "kv LoRA rank) × BF16 bytes + padded tokens × latent-cache width × cache-element bytes"
             ),
             hbm_substitution=(
                 f"{workload.batch_size} × {workload.context_length} × "
-                f"{config.mla_latent_cache_dim} × {BF16_BYTES} × "
+                f"{config.mla_latent_cache_dim} × {kv_cache_bytes} × "
                 f"{_display_number(assumptions.mla_kv_read_amplification)} + "
                 f"{tokens} × {local_heads} × ({config.mla_latent_cache_dim} + "
                 f"{config.kv_lora_rank}) × {BF16_BYTES} + {tokens} × "
-                f"{config.mla_latent_cache_dim} × {BF16_BYTES}"
+                f"{config.mla_latent_cache_dim} × {kv_cache_bytes}"
             ),
             notes=(
                 "KV-cache HBM traffic assumes the configured read-amplification factor; 1.0 is a logical minimum.",
@@ -1547,9 +1743,10 @@ def _mla_attention(
     return _attention_all_reduce(
         builder,
         dependency=o_proj,
-        token_count=tokens,
+        token_count=collective_token_count or tokens,
         hidden_size=config.hidden_size,
         fuse_pending_prefix=fuse_pending_prefix,
+        reduce_scatter=reduce_scatter,
     )
 
 
@@ -1560,8 +1757,86 @@ def _dense_ffn(
     workload: Workload,
     config: KimiK3TextConfig,
     hardware: HardwareSpec,
+    work_ledger: ParallelWorkLedger | None = None,
 ) -> str:
-    tokens = workload.token_count
+    tokens = (
+        work_ledger.global_model_rows
+        if work_ledger is not None
+        else workload.token_count
+    )
+    dense_root = root
+    if work_ledger is not None and hardware.attention_dp_size > 1:
+        global_bytes = tokens * config.hidden_size * BF16_BYTES
+        global_local_domain = (
+            min(8, hardware.tp_size)
+            if hardware.family == "b300"
+            else hardware.tp_size
+        )
+        if work_ledger.dp_padding_mode == "sum_len":
+            dense_root = builder.add_collective(
+                op_id="dense_dp_gather_all_reduce",
+                name="SUM_LEN DP gather via global-TP all-reduce",
+                category="communication",
+                kind="all_reduce",
+                logical_bytes=global_bytes,
+                logical_bytes_formula=(
+                    "global model rows × hidden size × BF16 bytes"
+                ),
+                logical_bytes_substitution=(
+                    f"{tokens} × {config.hidden_size} × {BF16_BYTES}"
+                ),
+                group_size=hardware.tp_size,
+                local_domain_size=global_local_domain,
+                dependencies=(root,),
+                notes=(
+                    "Pinned SGLang SUM_LEN writes DP-local slices into one global buffer and all-reduces it across global TP.",
+                ),
+            )
+        else:
+            local_bytes = (
+                work_ledger.critical_model_rows
+                * config.hidden_size
+                * BF16_BYTES
+            )
+            local_scatter = builder.add_collective(
+                op_id="dense_dp_gather_tp_reduce_scatter",
+                name="MAX_LEN attention-TP row reduce-scatter",
+                category="communication",
+                kind="reduce_scatter",
+                logical_bytes=local_bytes,
+                logical_bytes_formula=(
+                    "critical DP rows × hidden size × BF16 bytes"
+                ),
+                logical_bytes_substitution=(
+                    f"{work_ledger.critical_model_rows} × {config.hidden_size} × "
+                    f"{BF16_BYTES}"
+                ),
+                group_size=hardware.attention_tp_size,
+                local_domain_size=hardware.attention_tp_size,
+                dependencies=(root,),
+                notes=(
+                    "Pinned SGLang first reduce-scatters each padded DP-local tensor across attention TP8.",
+                ),
+            )
+            dense_root = builder.add_collective(
+                op_id="dense_dp_gather_global_all_gather",
+                name="MAX_LEN sharded-row global-TP all-gather",
+                category="communication",
+                kind="all_gather",
+                logical_bytes=global_bytes,
+                logical_bytes_formula=(
+                    "global model rows × hidden size × BF16 bytes"
+                ),
+                logical_bytes_substitution=(
+                    f"{tokens} × {config.hidden_size} × {BF16_BYTES}"
+                ),
+                group_size=hardware.tp_size,
+                local_domain_size=global_local_domain,
+                dependencies=(local_scatter,),
+                notes=(
+                    "Pinned SGLang then all-gathers the TP8 row shards across global TP.",
+                ),
+            )
     local_intermediate = config.dense_intermediate_size // hardware.tp_size
     gate_up = builder.add_gemm(
         op_id="dense_gate_up",
@@ -1571,7 +1846,7 @@ def _dense_ffn(
         k=config.hidden_size,
         n=2 * local_intermediate,
         weight_bytes_per_parameter=BF16_BYTES,
-        dependencies=(root,),
+        dependencies=(dense_root,),
     )
     activation = builder.add_roofline(
         op_id="dense_situ",
@@ -1605,31 +1880,41 @@ def _dense_ffn(
         logical_bytes_substitution=(f"{tokens} × {config.hidden_size} × {BF16_BYTES}"),
         dependencies=(down,),
     )
+    reduced_local = reduced
+    prefix_tokens = tokens
+    if work_ledger is not None and hardware.attention_dp_size > 1:
+        prefix_tokens = work_ledger.critical_model_rows
+        reduced_local = builder.add_roofline(
+            op_id="dense_dp_scatter",
+            name="Local DP row selection after dense FFN",
+            category="communication",
+            dependencies=(reduced,),
+            hbm_bytes=(
+                2 * prefix_tokens * config.hidden_size * BF16_BYTES
+            ),
+            hbm_formula=(
+                "2 copy passes × critical DP rows × hidden size × BF16 bytes"
+            ),
+            hbm_substitution=(
+                f"2 × {prefix_tokens} × {config.hidden_size} × {BF16_BYTES}"
+            ),
+            notes=("SGLang dp_scatter is a local slice/copy after global TP reduction.",),
+        )
     return builder.add_roofline(
         op_id="dense_prefix_add",
         name="Dense FFN prefix/residual add",
         category="elementwise",
-        dependencies=(reduced,),
-        flops=tokens * config.hidden_size,
-        hbm_bytes=3 * tokens * config.hidden_size * BF16_BYTES,
+        dependencies=(reduced_local,),
+        flops=prefix_tokens * config.hidden_size,
+        hbm_bytes=3 * prefix_tokens * config.hidden_size * BF16_BYTES,
         flops_formula="tokens × hidden size",
-        flops_substitution=f"{tokens} × {config.hidden_size}",
+        flops_substitution=f"{prefix_tokens} × {config.hidden_size}",
         hbm_formula="3 passes × tokens × hidden size × BF16 bytes",
-        hbm_substitution=(f"3 × {tokens} × {config.hidden_size} × {BF16_BYTES}"),
+        hbm_substitution=(
+            f"3 × {prefix_tokens} × {config.hidden_size} × {BF16_BYTES}"
+        ),
         notes=("KimiK3MLP adds the decoder prefix_sum after down projection.",),
     )
-
-
-def _expected_unique_experts(
-    *, total_experts: int, local_experts: int, tokens: int, top_k: int
-) -> float:
-    if tokens <= 0:
-        return 0.0
-    if tokens == 1:
-        return local_experts * top_k / total_experts
-    # Each token chooses top_k distinct experts. For any particular expert the
-    # probability of omission by one uniform token is 1-top_k/total_experts.
-    return local_experts * (1.0 - math.pow(1.0 - top_k / total_experts, tokens))
 
 
 def _marlin_m_block_size(*, tokens: int, top_k: int, local_experts: int) -> int:
@@ -1640,6 +1925,356 @@ def _marlin_m_block_size(*, tokens: int, top_k: int, local_experts: int) -> int:
         if pairs_per_local_expert / block_size < 0.9:
             return block_size
     return 64
+
+
+def _blackwell_a2a_link_bytes(
+    *,
+    sent_pairs_by_dp: tuple[int, ...],
+    attention_tp_size: int,
+    ep_size: int,
+    local_domain_size: int,
+    routed_width: int,
+) -> tuple[float, float]:
+    """Return conditional critical directional bytes per local/remote fabric."""
+
+    sent_pairs_by_rank = tuple(
+        sent_pairs
+        for sent_pairs in sent_pairs_by_dp
+        for _ in range(attention_tp_size)
+    )
+    if len(sent_pairs_by_rank) != ep_size or ep_size % local_domain_size:
+        raise AssertionError("K3 A2A rank layout must contain whole local domains.")
+
+    total_sent_pairs = sum(sent_pairs_by_rank)
+    critical_local_bytes = 0.0
+    critical_remote_bytes = 0.0
+    for rank, sent_pairs in enumerate(sent_pairs_by_rank):
+        domain_start = rank // local_domain_size * local_domain_size
+        domain_sent_pairs = sum(
+            sent_pairs_by_rank[domain_start : domain_start + local_domain_size]
+        )
+        local_sent_pairs = sent_pairs * (local_domain_size - 1) / ep_size
+        local_received_pairs = (domain_sent_pairs - sent_pairs) / ep_size
+        remote_sent_pairs = sent_pairs * (ep_size - local_domain_size) / ep_size
+        remote_received_pairs = (
+            total_sent_pairs - domain_sent_pairs
+        ) / ep_size
+
+        local_outbound = (
+            FP8_BYTES * local_sent_pairs
+            + BF16_BYTES * local_received_pairs
+        )
+        local_inbound = (
+            FP8_BYTES * local_received_pairs
+            + BF16_BYTES * local_sent_pairs
+        )
+        remote_outbound = (
+            FP8_BYTES * remote_sent_pairs
+            + BF16_BYTES * remote_received_pairs
+        )
+        remote_inbound = (
+            FP8_BYTES * remote_received_pairs
+            + BF16_BYTES * remote_sent_pairs
+        )
+        critical_local_bytes = max(
+            critical_local_bytes,
+            routed_width * max(local_outbound, local_inbound),
+        )
+        critical_remote_bytes = max(
+            critical_remote_bytes,
+            routed_width * max(remote_outbound, remote_inbound),
+        )
+    return critical_local_bytes, critical_remote_bytes
+
+
+def _blackwell_a2a_moe_ffn(
+    builder: _LayerBuilder,
+    *,
+    root: str,
+    config: KimiK3TextConfig,
+    hardware: HardwareSpec,
+    work_ledger: ParallelWorkLedger,
+) -> str:
+    """Account for K3's MegaMoE/DeepGEMM path without TP-MoE formulas."""
+
+    source_rows = work_ledger.critical_source_rows_per_rank
+    received_pairs = work_ledger.balanced_received_pairs_per_ep_rank
+    routed_width = config.routed_expert_hidden_size
+    expert_width = config.moe_intermediate_size
+    shared_width = config.shared_intermediate_size
+
+    router = builder.add_roofline(
+        op_id="moe_ep_router",
+        name="EP router projection",
+        category="moe_front",
+        dependencies=(root,),
+        flops=2.0 * source_rows * config.hidden_size * config.num_experts,
+        hbm_bytes=(
+            config.hidden_size * config.num_experts * BF16_BYTES
+            + source_rows * config.num_experts * FP32_BYTES
+        ),
+        flops_formula="2 × source rows × hidden size × experts",
+        flops_substitution=(
+            f"2 × {source_rows} × {config.hidden_size} × {config.num_experts}"
+        ),
+        hbm_formula=(
+            "hidden size × experts × BF16 weight bytes + source rows × experts "
+            "× FP32 router-intermediate bytes"
+        ),
+        hbm_substitution=(
+            f"{config.hidden_size} × {config.num_experts} × {BF16_BYTES} + "
+            f"{source_rows} × {config.num_experts} × {FP32_BYTES}"
+        ),
+        notes=(
+            "The pinned overlap path can run router/TopK concurrently with latent-down.",
+            "The source activation read is counted once on the latent-down branch; merged or cache-sharing implementations need not read it twice from HBM.",
+        ),
+    )
+    latent_down = builder.add_gemm(
+        op_id="moe_ep_latent_down",
+        name="EP routed latent-down projection",
+        category="moe_front",
+        m=source_rows,
+        k=config.hidden_size,
+        n=routed_width,
+        weight_bytes_per_parameter=BF16_BYTES,
+        dependencies=(root,),
+        notes=(
+            "This branch may overlap router/TopK and joins it before pre-dispatch quantization.",
+        ),
+    )
+
+    topk = builder.add_roofline(
+        op_id="moe_topk",
+        name="Top-16 routing",
+        category="moe_routing",
+        dependencies=(router,),
+        hbm_bytes=(
+            source_rows * config.num_experts * FP32_BYTES
+            + config.num_experts * FP32_BYTES
+            + source_rows
+            * config.num_experts_per_token
+            * (FP32_BYTES + 4)
+        ),
+        hbm_formula=(
+            "source rows × experts × FP32 router-intermediate read + expert "
+            "correction bias + source rows × top-k × "
+            "(FP32 weight + int32 ID)"
+        ),
+        hbm_substitution=(
+            f"{source_rows} × {config.num_experts} × {FP32_BYTES} + "
+            f"{config.num_experts} × {FP32_BYTES} "
+            f"+ {source_rows} × {config.num_experts_per_token} × "
+            f"({FP32_BYTES} + 4)"
+        ),
+        notes=(
+            "The public EP front completes TopK before issuing the shared-expert side stream.",
+            "TopK instruction count is excluded because no source-backed FLOP lower bound is available.",
+        ),
+    )
+
+    predispatch = builder.add_roofline(
+        op_id="moe_predispatch_quant",
+        name="MegaMoE FP8 pre-dispatch quantization",
+        category="moe_routing",
+        dependencies=(topk, latent_down),
+        hbm_bytes=source_rows * routed_width * (BF16_BYTES + 1),
+        hbm_formula=(
+            "source rows × routed width × (BF16 input read + FP8 value write)"
+        ),
+        hbm_substitution=(
+            f"{source_rows} × {routed_width} × ({BF16_BYTES} + 1)"
+        ),
+        notes=(
+            "Pre-dispatch quantization is once per source row, not once per expert pair.",
+            "Quantization FLOPs and FP8 scale traffic are excluded positive terms.",
+        ),
+    )
+
+    shared_gate_up = builder.add_gemm(
+        op_id="moe_shared_gate_up_tp1",
+        name="Replicated TP1 shared-expert gate/up",
+        category="moe_shared",
+        m=source_rows,
+        k=config.hidden_size,
+        n=2 * shared_width,
+        weight_bytes_per_parameter=BF16_BYTES,
+        dependencies=(topk,),
+        notes=(
+            "K3 replicates the complete BF16 shared expert on every EP A2A rank.",
+            "This branch is issued on a side stream while MegaMoE executes.",
+        ),
+    )
+    shared_situ = builder.add_roofline(
+        op_id="moe_shared_situ_tp1",
+        name="Replicated TP1 shared-expert SiTU",
+        category="moe_shared",
+        dependencies=(shared_gate_up,),
+        flops=8.0 * source_rows * shared_width,
+        hbm_bytes=3 * source_rows * shared_width * BF16_BYTES,
+        flops_formula="8 × source rows × full shared width",
+        flops_substitution=f"8 × {source_rows} × {shared_width}",
+        hbm_formula="3 passes × source rows × full shared width × BF16 bytes",
+        hbm_substitution=(
+            f"3 × {source_rows} × {shared_width} × {BF16_BYTES}"
+        ),
+    )
+    shared_down = builder.add_gemm(
+        op_id="moe_shared_down_tp1",
+        name="Replicated TP1 shared-expert down projection",
+        category="moe_shared",
+        m=source_rows,
+        k=shared_width,
+        n=config.hidden_size,
+        weight_bytes_per_parameter=BF16_BYTES,
+        dependencies=(shared_situ,),
+    )
+
+    touched_experts = 1.0 if received_pairs else 0.0
+    params_per_expert = 3 * routed_width * expert_width
+    weight_bytes = touched_experts * (
+        params_per_expert * config.mxfp4_weight_bytes_per_parameter
+    )
+    activation_bytes = (
+        received_pairs * routed_width * FP8_BYTES
+        + source_rows * routed_width * BF16_BYTES
+    )
+    mega_hbm = weight_bytes + activation_bytes
+    mega_flops = (
+        received_pairs * 6 * routed_width * expert_width
+    )
+    local_domain_size = (
+        min(8, hardware.tp_size)
+        if hardware.family == "b300"
+        else hardware.tp_size
+    )
+    intra_link_bytes, inter_link_bytes = _blackwell_a2a_link_bytes(
+        sent_pairs_by_dp=work_ledger.sent_pairs_per_attention_rank_by_dp,
+        attention_tp_size=hardware.attention_tp_size,
+        ep_size=hardware.ep_size,
+        local_domain_size=local_domain_size,
+        routed_width=routed_width,
+    )
+    payload_bytes = routed_width * max(
+        FP8_BYTES * work_ledger.critical_sent_pairs_per_source_rank
+        + BF16_BYTES * received_pairs,
+        FP8_BYTES * received_pairs
+        + BF16_BYTES * work_ledger.critical_sent_pairs_per_source_rank,
+    )
+    mega = builder.add_collective(
+        op_id="moe_routed_experts",
+        name="MegaMoE fused A2A dispatch, DeepGEMM experts, and combine",
+        category="moe_experts",
+        kind="all_to_all",
+        logical_bytes=payload_bytes,
+        logical_bytes_formula=(
+            "routed width × max(critical-rank FP8 dispatch + BF16 combine sent, "
+            "critical-rank FP8 dispatch + BF16 combine received)"
+        ),
+        logical_bytes_substitution=(
+            f"{routed_width} × max({work_ledger.critical_sent_pairs_per_source_rank} "
+            f"× {FP8_BYTES} + {received_pairs} × {BF16_BYTES}, "
+            f"{received_pairs} × {FP8_BYTES} + "
+            f"{work_ledger.critical_sent_pairs_per_source_rank} × {BF16_BYTES})"
+        ),
+        group_size=hardware.ep_size,
+        local_domain_size=local_domain_size,
+        intra_link_bytes_per_rank=intra_link_bytes,
+        inter_link_bytes_per_rank=inter_link_bytes,
+        dependencies=(predispatch,),
+        flops=mega_flops,
+        hbm_bytes=mega_hbm,
+        compute_kind="k3_expert",
+        flops_formula=(
+            "balanced received pairs × 6 × routed width × expert width"
+        ),
+        flops_substitution=(
+            f"{received_pairs} × 6 × {routed_width} × {expert_width}"
+        ),
+        hbm_formula=(
+            "one deterministically touched expert × 3 × routed width × expert "
+            "width × MXFP4 bytes + balanced received pairs × FP8 "
+            "routed input + source rows × routed width × BF16 combined output"
+        ),
+        hbm_substitution=(
+            f"{_display_number(touched_experts)} × 3 × {routed_width} × "
+            f"{expert_width} × "
+            f"{_display_number(config.mxfp4_weight_bytes_per_parameter)} + "
+            f"{received_pairs} × {routed_width} × {FP8_BYTES} + {source_rows} × "
+            f"{routed_width} × {BF16_BYTES}"
+        ),
+        notes=(
+            "Certified routed FLOPs include only the three grouped GEMMs (6RI per received token-expert pair).",
+            "Certified HBM includes one touched expert plus visible FP8 input and BF16 combined output; expected occupancy and internal intermediate traffic are excluded.",
+            "The directional FP8-dispatch/BF16-combine payload is conditional on ideal-balanced routing.",
+            "Dispatch, grouped GEMMs, and combine are one composite roofline operation because MegaMoE pipelines them.",
+        ),
+    )
+
+    latent_norm = builder.add_roofline(
+        op_id="moe_latent_norm",
+        name="MegaMoE combined latent RMSNorm",
+        category="normalization",
+        dependencies=(mega,),
+        flops=5.0 * source_rows * routed_width,
+        hbm_bytes=(
+            2 * source_rows * routed_width * BF16_BYTES
+            + routed_width * BF16_BYTES
+        ),
+        flops_formula="5 × source rows × routed width",
+        flops_substitution=f"5 × {source_rows} × {routed_width}",
+        hbm_formula=(
+            "2 passes × source rows × routed width × BF16 bytes + RMSNorm weight"
+        ),
+        hbm_substitution=(
+            f"2 × {source_rows} × {routed_width} × {BF16_BYTES} + "
+            f"{routed_width} × {BF16_BYTES}"
+        ),
+        notes=("MegaMoE combine already returns complete rows; no TP reduce follows.",),
+    )
+    latent_up = builder.add_gemm(
+        op_id="moe_latent_up_replicated",
+        name="Replicated latent-up projection",
+        category="moe_tail",
+        m=source_rows,
+        k=routed_width,
+        n=config.hidden_size,
+        weight_bytes_per_parameter=BF16_BYTES,
+        dependencies=(latent_norm,),
+    )
+    tail = builder.add_roofline(
+        op_id="moe_tail_add",
+        name="Routed, TP1 shared, and residual tail add",
+        category="elementwise",
+        dependencies=(latent_up, shared_down),
+        flops=2.0 * source_rows * config.hidden_size,
+        hbm_bytes=4 * source_rows * config.hidden_size * BF16_BYTES,
+        flops_formula="2 adds × source rows × hidden size",
+        flops_substitution=f"2 × {source_rows} × {config.hidden_size}",
+        hbm_formula="4 tensor passes × source rows × hidden size × BF16 bytes",
+        hbm_substitution=(
+            f"4 × {source_rows} × {config.hidden_size} × {BF16_BYTES}"
+        ),
+    )
+    return builder.add_collective(
+        op_id="moe_sp_all_gather",
+        name="SP-MoE row all-gather after MoE tail",
+        category="communication",
+        kind="all_gather",
+        logical_bytes=(
+            work_ledger.critical_model_rows * config.hidden_size * BF16_BYTES
+        ),
+        logical_bytes_formula="critical DP rows × hidden size × BF16 bytes",
+        logical_bytes_substitution=(
+            f"{work_ledger.critical_model_rows} × {config.hidden_size} × "
+            f"{BF16_BYTES}"
+        ),
+        group_size=hardware.attention_tp_size,
+        dependencies=(tail,),
+        notes=(
+            "RS + AG moves the same main BF16 payload as the former attention all-reduce.",
+        ),
+    )
 
 
 def _moe_ffn(
@@ -1716,37 +2351,30 @@ def _moe_ffn(
         )
         sharding_note = "All expert IDs are present as TP-sharded expert slices."
 
-    average_unique = _expected_unique_experts(
-        total_experts=config.num_experts,
-        local_experts=local_experts,
-        tokens=tokens,
-        top_k=config.num_experts_per_token,
-    )
-    average_unique_formula = (
-        "local experts × (1 − (1 − top-k / total experts)^tokens)"
-    )
-    average_unique_substitution = (
-        f"{local_experts} × (1 − (1 − {config.num_experts_per_token} / "
-        f"{config.num_experts})^{tokens})"
-    )
     if hardware.moe_sharding == "ep":
-        # End-to-end latency is gated by an active rank, not by the average
-        # over active and idle ranks. With any routed work, that rank must load
-        # at least one expert even when the per-rank average is below one.
-        unique = max(1.0, average_unique)
-        unique_formula = f"max(1, {average_unique_formula})"
-        unique_substitution = f"max(1, {average_unique_substitution})"
+        # The critical pair-count rank processes ceil(TK/EP) pairs. Since one
+        # token cannot select the same expert twice, that rank must touch at
+        # least ceil(K/EP) distinct local experts; every token can reuse them.
+        unique = float(
+            math.ceil(config.num_experts_per_token / hardware.ep_size)
+        )
+        unique_formula = "ceil(top-k / EP ranks)"
+        unique_substitution = (
+            f"ceil({config.num_experts_per_token} / {hardware.ep_size})"
+        )
         occupancy_note = (
-            "The critical active EP rank reads at least "
-            f"{unique:.3f} unique local expert weights under ideal balance."
+            "The critical active EP rank deterministically touches at least "
+            f"{int(unique)} local expert weight set(s)."
         )
     else:
-        unique = average_unique
-        unique_formula = average_unique_formula
-        unique_substitution = average_unique_substitution
+        # Every token selects top-k distinct IDs and every TP rank holds a slice
+        # of every expert. Multiple tokens may reuse the same top-k set.
+        unique = float(config.num_experts_per_token)
+        unique_formula = "top-k distinct experts"
+        unique_substitution = str(config.num_experts_per_token)
         occupancy_note = (
-            "Uniform-routing occupancy estimate reads "
-            f"{unique:.3f} unique local expert weights."
+            "Every TP rank deterministically touches at least the same "
+            f"{int(unique)} distinct expert weight slices."
         )
 
     expert_pairs = tokens * config.num_experts_per_token
@@ -1763,9 +2391,8 @@ def _moe_ffn(
             local_experts=local_experts,
         )
         # For every routing realization, padded rows are at least both the
-        # useful-row count and one M-block per active expert. Taking the maximum
-        # of those expectations preserves the calculator's optimistic-bound
-        # contract without pretending the exact routing histogram is known.
+        # useful-row count and one M-block per deterministically required active
+        # expert.
         padded_compute_instances = max(
             local_compute_instances, unique * marlin_m_block
         )
@@ -1777,7 +2404,7 @@ def _moe_ffn(
             + expert_pairs * 8 * local_expert_intermediate
         )
         expert_flops_formula = (
-            "max(local useful pairs, expected active local experts × Marlin M-block) "
+            "max(local useful pairs, minimum active local experts × Marlin M-block) "
             "× 6 × routed width × local expert intermediate + tokens × top-k × "
             "8 × local expert intermediate"
         )
@@ -1791,8 +2418,8 @@ def _moe_ffn(
         expert_backend_notes = (
             f"Marlin selects M-block {marlin_m_block}; the compute floor uses "
             f"{padded_compute_instances:.3f} padded row-equivalents per rank.",
-            "The padded-row count is a lower bound on expected uniform-routing "
-            "work, not an exact routing histogram.",
+            "The padded-row count uses only the deterministic minimum active "
+            "experts, not expected routing occupancy.",
         )
     elif hardware.moe_sharding == "ep":
         expert_flops = local_compute_instances * (
@@ -1980,14 +2607,14 @@ def _moe_ffn(
     shared_down = add_shared_branch((front_ready,)) if plain_collective_path else None
     route_dependencies = (shared_down,) if shared_down is not None else (front_ready,)
     fused_route_quant = blackwell_mxfp8 and tokens <= 64
-    route_flops = 6.0 * tokens * config.num_experts
+    route_flops = float(tokens * config.num_experts)
     route_hbm_bytes = (
         tokens * config.num_experts * BF16_BYTES
         + config.num_experts * FP32_BYTES
         + tokens * config.num_experts_per_token * (FP32_BYTES + 4)
     )
-    route_flops_formula = "6 × tokens × total experts"
-    route_flops_substitution = f"6 × {tokens} × {config.num_experts}"
+    route_flops_formula = "tokens × total experts compulsory correction-bias adds"
+    route_flops_substitution = f"{tokens} × {config.num_experts}"
     route_hbm_formula = (
         "tokens × total experts × BF16 logit bytes + total experts × FP32 bias bytes + "
         "tokens × top-k × (FP32 weight + int32 ID bytes)"
@@ -1998,15 +2625,10 @@ def _moe_ffn(
         f"{config.num_experts_per_token} × ({FP32_BYTES} + 4)"
     )
     if fused_route_quant:
-        route_flops += 3.0 * tokens * config.routed_expert_hidden_size
         route_hbm_bytes += tokens * (
             config.routed_expert_hidden_size
             * (BF16_BYTES + 1 + 1 / config.mxfp4_group_size)
             + config.num_experts_per_token * 4
-        )
-        route_flops_formula += " + 3 × tokens × routed-latent width"
-        route_flops_substitution += (
-            f" + 3 × {tokens} × {config.routed_expert_hidden_size}"
         )
         route_hbm_formula += (
             " + tokens × (routed width × (BF16 input + FP8 output + 1/group scale) "
@@ -2051,8 +2673,7 @@ def _moe_ffn(
                     else "H200 Marlin consumes BF16 routed activations without MXFP8 quantization."
                 )
             ),
-            "Quantization arithmetic is approximated as three operations per latent value.",
-            "Comparison cost is only approximated.",
+            "The compute certificate counts only one correction-bias add per expert; sigmoid, comparison, and quantization arithmetic are excluded.",
         ),
     )
     routed_ready = route
@@ -2062,15 +2683,15 @@ def _moe_ffn(
             name="MXFP8 routed-input quantization and top-k pack",
             category="moe_routing",
             dependencies=(route,),
-            flops=3.0 * tokens * config.routed_expert_hidden_size,
+            flops=0,
             hbm_bytes=(
                 tokens
                 * config.routed_expert_hidden_size
                 * (BF16_BYTES + 1 + 1 / config.mxfp4_group_size)
                 + tokens * config.num_experts_per_token * (FP32_BYTES + 4 + 4)
             ),
-            flops_formula="3 × tokens × routed-latent width",
-            flops_substitution=(f"3 × {tokens} × {config.routed_expert_hidden_size}"),
+            flops_formula="0; quantization arithmetic is excluded",
+            flops_substitution="0",
             hbm_formula=(
                 "tokens × routed width × (BF16 input + FP8 output + 1/group scale) + "
                 "tokens × top-k × (FP32 weight + int32 ID + packed int32 bytes)"
@@ -2084,6 +2705,7 @@ def _moe_ffn(
             notes=(
                 "FlashInfer's standalone path writes FP8 values plus one UE8M0 scale per group of 32.",
                 "Top-k pack reads FP32 weights/int32 IDs and writes packed int32 metadata.",
+                "Quantization and packing arithmetic are excluded from the compute certificate.",
             ),
         )
     experts = builder.add_roofline(
@@ -2314,6 +2936,7 @@ def _decoder_layer(
     config: KimiK3TextConfig,
     hardware: HardwareSpec,
     assumptions: EstimatorAssumptions,
+    work_ledger: ParallelWorkLedger | None = None,
 ) -> LayerEstimate:
     builder = _LayerBuilder(
         name=f"decoder_{layer.number:02d}",
@@ -2323,11 +2946,25 @@ def _decoder_layer(
         hardware=hardware,
         assumptions=assumptions,
     )
+    model_rows = (
+        work_ledger.critical_model_rows
+        if work_ledger is not None
+        else workload.token_count
+    )
+    reduce_scatter = bool(
+        work_ledger is not None
+        and layer.ffn == "moe"
+    )
+    post_attention_rows = (
+        work_ledger.critical_source_rows_per_rank
+        if reduce_scatter and work_ledger is not None
+        else model_rows
+    )
     agg1 = _residual_aggregate(
         builder,
         op_id="attn_residual_1",
         dependencies=(),
-        token_count=workload.token_count,
+        token_count=model_rows,
         hidden_size=config.hidden_size,
         previous_blocks=layer.aggregation_1_previous_blocks,
         write_snapshot=layer.attention_residual_write,
@@ -2335,8 +2972,17 @@ def _decoder_layer(
     has_pending_prefix = not layer.attention_residual_write
     fuse_attention_prefix = (
         has_pending_prefix
-        and hardware.k3_fused_all_reduce_capable
-        and assumptions.blackwell_k3_fused_all_reduce
+        and (
+            (
+                hardware.k3_fused_all_reduce_capable
+                and assumptions.blackwell_k3_fused_all_reduce
+            )
+            or (
+                reduce_scatter
+                and hardware.family in ("b300", "gb300")
+                and hardware.sp_moe
+            )
+        )
     )
     if layer.attention == "kda":
         attention_end = _kda_attention(
@@ -2347,6 +2993,8 @@ def _decoder_layer(
             hardware=hardware,
             assumptions=assumptions,
             fuse_pending_prefix=fuse_attention_prefix,
+            collective_token_count=model_rows,
+            reduce_scatter=reduce_scatter,
         )
     else:
         attention_end = _mla_attention(
@@ -2357,6 +3005,8 @@ def _decoder_layer(
             hardware=hardware,
             assumptions=assumptions,
             fuse_pending_prefix=fuse_attention_prefix,
+            collective_token_count=model_rows,
+            reduce_scatter=reduce_scatter,
         )
     if has_pending_prefix and not fuse_attention_prefix:
         attention_end = builder.add_roofline(
@@ -2364,23 +3014,23 @@ def _decoder_layer(
             name="Materialized pending attention-prefix add",
             category="elementwise",
             dependencies=(attention_end,),
-            flops=workload.token_count * config.hidden_size,
-            hbm_bytes=(3 * workload.token_count * config.hidden_size * BF16_BYTES),
+            flops=post_attention_rows * config.hidden_size,
+            hbm_bytes=(3 * post_attention_rows * config.hidden_size * BF16_BYTES),
             flops_formula="tokens × hidden size",
-            flops_substitution=(f"{workload.token_count} × {config.hidden_size}"),
+            flops_substitution=(f"{post_attention_rows} × {config.hidden_size}"),
             hbm_formula="3 passes × tokens × hidden size × BF16 bytes",
             hbm_substitution=(
-                f"3 × {workload.token_count} × {config.hidden_size} × {BF16_BYTES}"
+                f"3 × {post_attention_rows} × {config.hidden_size} × {BF16_BYTES}"
             ),
             notes=(
-                "Ordinary attention all-reduce cannot consume agg1's pending prefix.",
+                "The selected attention collective does not fuse agg1's pending prefix.",
             ),
         )
     agg2 = _residual_aggregate(
         builder,
         op_id="attn_residual_2",
         dependencies=(attention_end,),
-        token_count=workload.token_count,
+        token_count=post_attention_rows,
         hidden_size=config.hidden_size,
         previous_blocks=layer.aggregation_2_previous_blocks,
         write_snapshot=False,
@@ -2392,16 +3042,26 @@ def _decoder_layer(
             workload=workload,
             config=config,
             hardware=hardware,
+            work_ledger=work_ledger,
         )
     else:
-        _moe_ffn(
-            builder,
-            root=agg2,
-            workload=workload,
-            config=config,
-            hardware=hardware,
-            assumptions=assumptions,
-        )
+        if work_ledger is not None:
+            _blackwell_a2a_moe_ffn(
+                builder,
+                root=agg2,
+                config=config,
+                hardware=hardware,
+                work_ledger=work_ledger,
+            )
+        else:
+            _moe_ffn(
+                builder,
+                root=agg2,
+                workload=workload,
+                config=config,
+                hardware=hardware,
+                assumptions=assumptions,
+            )
     return builder.finish()
 
 
@@ -2411,6 +3071,7 @@ def _embedding_layer(
     config: KimiK3TextConfig,
     hardware: HardwareSpec,
     assumptions: EstimatorAssumptions,
+    work_ledger: ParallelWorkLedger | None = None,
 ) -> LayerEstimate:
     builder = _LayerBuilder(
         name="embedding",
@@ -2420,13 +3081,17 @@ def _embedding_layer(
         hardware=hardware,
         assumptions=assumptions,
     )
-    tokens = workload.token_count
+    tokens = (
+        work_ledger.critical_model_rows
+        if work_ledger is not None
+        else workload.token_count
+    )
     lookup = builder.add_roofline(
         op_id="embedding_lookup",
         name="Vocab-parallel BF16 embedding lookup",
         category="embedding",
         hbm_bytes=(
-            tokens * config.hidden_size * BF16_BYTES / hardware.tp_size
+            tokens * config.hidden_size * BF16_BYTES / hardware.attention_tp_size
             + tokens * config.hidden_size * BF16_BYTES
         ),
         hbm_formula=(
@@ -2434,7 +3099,8 @@ def _embedding_layer(
             "tokens × hidden size × BF16 bytes (local output)"
         ),
         hbm_substitution=(
-            f"{tokens} × {config.hidden_size} × {BF16_BYTES} / {hardware.tp_size} "
+            f"{tokens} × {config.hidden_size} × {BF16_BYTES} / "
+            f"{hardware.attention_tp_size} "
             f"+ {tokens} × {config.hidden_size} × {BF16_BYTES}"
         ),
         notes=("Assumes token IDs are uniformly distributed across vocab shards.",),
@@ -2447,6 +3113,7 @@ def _embedding_layer(
         logical_bytes=tokens * config.hidden_size * BF16_BYTES,
         logical_bytes_formula="tokens × hidden size × BF16 bytes",
         logical_bytes_substitution=(f"{tokens} × {config.hidden_size} × {BF16_BYTES}"),
+        group_size=hardware.attention_tp_size,
         dependencies=(lookup,),
     )
     return builder.finish()
@@ -2458,6 +3125,7 @@ def _final_norm_layer(
     config: KimiK3TextConfig,
     hardware: HardwareSpec,
     assumptions: EstimatorAssumptions,
+    work_ledger: ParallelWorkLedger | None = None,
 ) -> LayerEstimate:
     builder = _LayerBuilder(
         name="final_attention_residual_norm",
@@ -2474,7 +3142,11 @@ def _final_norm_layer(
         builder,
         op_id="final_attn_residual_norm",
         dependencies=(),
-        token_count=workload.token_count,
+        token_count=(
+            work_ledger.critical_model_rows
+            if work_ledger is not None
+            else workload.token_count
+        ),
         hidden_size=config.hidden_size,
         previous_blocks=final_blocks,
         write_snapshot=False,
@@ -2489,6 +3161,7 @@ def _lm_head_layer(
     config: KimiK3TextConfig,
     hardware: HardwareSpec,
     assumptions: EstimatorAssumptions,
+    work_ledger: ParallelWorkLedger | None = None,
 ) -> LayerEstimate:
     builder = _LayerBuilder(
         name="lm_head",
@@ -2499,7 +3172,7 @@ def _lm_head_layer(
         assumptions=assumptions,
     )
     tokens = workload.logits_token_count
-    local_vocab = config.vocab_size // hardware.tp_size
+    local_vocab = config.vocab_size // hardware.lm_head_tp_size
     logits = builder.add_gemm(
         op_id="lm_head_gemm",
         name="Vocab-parallel BF16 LM head",
@@ -2536,6 +3209,7 @@ def _lm_head_layer(
         logical_bytes=tokens * config.vocab_size * BF16_BYTES,
         logical_bytes_formula="logit rows × vocabulary size × BF16 bytes",
         logical_bytes_substitution=(f"{tokens} × {config.vocab_size} × {BF16_BYTES}"),
+        group_size=hardware.lm_head_tp_size,
         dependencies=(scaled_logits,),
     )
     return builder.finish()
@@ -2546,13 +3220,16 @@ def _weight_memory(
 ) -> tuple[float, dict[str, float]]:
     h = config.hidden_size
     tp = hardware.tp_size
+    attention_tp = hardware.attention_tp_size
     p = config.projection_size
     local_heads = hardware.local_attention_heads
     bf16 = float(BF16_BYTES)
     breakdown: dict[str, float] = {
-        "embedding": config.vocab_size * h * bf16 / tp,
+        "embedding": config.vocab_size * h * bf16 / attention_tp,
         "lm_head": (
-            0.0 if config.tie_word_embeddings else config.vocab_size * h * bf16 / tp
+            0.0
+            if config.tie_word_embeddings
+            else config.vocab_size * h * bf16 / hardware.lm_head_tp_size
         ),
         "decoder_norms_and_attention_residual": 0.0,
         "kda_attention": 0.0,
@@ -2569,15 +3246,17 @@ def _weight_memory(
         breakdown["decoder_norms_and_attention_residual"] += 6 * h * bf16
         if layer.attention == "kda":
             kda_params_bf16 = (
-                h * (4 * p // tp)
+                h * (4 * p // attention_tp)
                 + h * local_heads
                 + h * config.head_dim
-                + config.head_dim * (p // tp)
-                + (p // tp) * h
+                + config.head_dim * (p // attention_tp)
+                + (p // attention_tp) * h
                 + config.head_dim
             )
             kda_params_fp32 = (
-                3 * p * config.short_conv_kernel_size // tp + p // tp + local_heads
+                3 * p * config.short_conv_kernel_size // attention_tp
+                + p // attention_tp
+                + local_heads
             )
             breakdown["kda_attention"] += (
                 kda_params_bf16 * bf16 + kda_params_fp32 * FP32_BYTES
@@ -2610,7 +3289,10 @@ def _weight_memory(
             dense_moe_bf16_params = (
                 config.num_experts * h
                 + 2 * h * config.routed_expert_hidden_size
-                + 3 * h * config.shared_intermediate_size / tp
+                + 3
+                * h
+                * config.shared_intermediate_size
+                / hardware.shared_expert_tp_size
                 + config.routed_expert_hidden_size
             )
             breakdown["moe_router_latent_shared"] += (
@@ -2645,11 +3327,22 @@ def _weight_memory(
     return sum(breakdown.values()), breakdown
 
 
+def static_weight_bytes_per_rank(
+    hardware: HardwareSpec,
+    config: KimiK3TextConfig = KIMI_K3_TEXT_CONFIG,
+) -> float:
+    """Return workload-independent static model bytes resident on one rank."""
+
+    weights, _ = _weight_memory(config, hardware)
+    return weights
+
+
 def _memory_estimate(
     *,
     workload: Workload,
     config: KimiK3TextConfig,
     hardware: HardwareSpec,
+    work_ledger: ParallelWorkLedger | None = None,
 ) -> MemoryEstimate:
     weights, breakdown = _weight_memory(config, hardware)
     local_heads = hardware.local_attention_heads
@@ -2658,7 +3351,7 @@ def _memory_estimate(
         * local_heads
         * config.head_dim
         * config.v_head_dim
-        * FP32_BYTES
+        * hardware.kda_state_bytes_per_element
     )
     kda_conv_per_request = (
         len(config.kda_layers)
@@ -2678,16 +3371,30 @@ def _memory_estimate(
         cache_tokens
         * len(config.full_attention_layers)
         * config.mla_latent_cache_dim
-        * BF16_BYTES
+        * hardware.kv_cache_bytes_per_element
     )
     model_and_cache = weights + kda_state + mla_kv
     attention_residual_bank = (
-        workload.token_count
+        (
+            work_ledger.critical_model_rows
+            if work_ledger is not None
+            else workload.token_count
+        )
         * math.ceil(config.num_hidden_layers / config.attention_residual_block_size)
         * config.hidden_size
         * BF16_BYTES
     )
     total_accounted = model_and_cache + attention_residual_bank
+    exceeds_capacity = total_accounted > hardware.nominal_hbm_capacity_bytes_per_gpu
+    if exceeds_capacity:
+        fits_capacity: bool | None = False
+        capacity_status = "accounted_lower_bound_exceeds_nominal_hbm"
+    elif hardware.uses_moe_a2a:
+        fits_capacity = None
+        capacity_status = "inconclusive_megamoe_workspace_excluded"
+    else:
+        fits_capacity = True
+        capacity_status = "accounted_peak_fits_nominal_hbm"
     return MemoryEstimate(
         static_weight_bytes_per_rank=weights,
         kda_state_bytes_per_rank=kda_state,
@@ -2698,10 +3405,197 @@ def _memory_estimate(
         nominal_hbm_capacity_bytes_per_rank=(
             hardware.nominal_hbm_capacity_bytes_per_gpu
         ),
-        fits_nominal_capacity=(
-            total_accounted <= hardware.nominal_hbm_capacity_bytes_per_gpu
-        ),
+        fits_nominal_capacity=fits_capacity,
+        capacity_status=capacity_status,
         weight_breakdown_bytes_per_rank=breakdown,
+    )
+
+
+def _balanced_request_counts(total: int, parts: int) -> tuple[int, ...]:
+    base, remainder = divmod(total, parts)
+    return tuple(base + (index < remainder) for index in range(parts))
+
+
+def _captured_batch_size(batch_size: int, hardware: HardwareSpec) -> int:
+    if batch_size == 0:
+        return 0
+    return next(
+        bucket
+        for bucket in hardware.decode_cuda_graph_batch_sizes
+        if bucket >= batch_size
+    )
+
+
+def _blackwell_decode_model_rows(
+    *,
+    dp_requests: tuple[int, ...],
+    hardware: HardwareSpec,
+    decode_cuda_graph_replay: bool,
+) -> tuple[tuple[int, ...], tuple[int, ...], str]:
+    """Mirror SGLang's MLP-sync alignment and DP padding order."""
+
+    aligned_rows = tuple(
+        math.ceil(rows / hardware.attention_tp_size)
+        * hardware.attention_tp_size
+        if rows
+        else 0
+        for rows in dp_requests
+    )
+    maximum_rows = max(aligned_rows)
+    if decode_cuda_graph_replay:
+        captured_rows = _captured_batch_size(maximum_rows, hardware)
+        return (
+            aligned_rows,
+            (captured_rows,) * hardware.attention_dp_size,
+            "max_len_cuda_graph",
+        )
+
+    # DpPaddingMode.get_dp_padding_mode minimizes DP communication after the
+    # mandatory attention-TP alignment. Decode selects MAX_LEN when its
+    # communication volume is no larger than SUM_LEN, including equality.
+    use_max_len = (
+        sum(aligned_rows) * 2
+        >= maximum_rows * hardware.attention_dp_size
+    )
+    if use_max_len:
+        return (
+            aligned_rows,
+            (maximum_rows,) * hardware.attention_dp_size,
+            "max_len",
+        )
+    return aligned_rows, aligned_rows, "sum_len"
+
+
+def _parallel_work_ledger(
+    *,
+    workload: Workload,
+    hardware: HardwareSpec,
+    decode_cuda_graph_replay: bool,
+) -> ParallelWorkLedger | None:
+    if not hardware.uses_moe_a2a:
+        return None
+
+    dp_requests = _balanced_request_counts(
+        workload.batch_size, hardware.attention_dp_size
+    )
+    if workload.phase == "prefill":
+        assert workload.sequence_length is not None
+        attention_rows = tuple(
+            requests * workload.sequence_length for requests in dp_requests
+        )
+        # require_mlp_sync pads extend rows to an attention-TP multiple. K3
+        # trims those rows from attention, but keeps them for residual/MoE work.
+        mlp_aligned_rows = tuple(
+            math.ceil(rows / hardware.attention_tp_size)
+            * hardware.attention_tp_size
+            if rows
+            else 0
+            for rows in attention_rows
+        )
+        model_rows = mlp_aligned_rows
+        dp_padding_mode = "sum_len" if hardware.attention_dp_size > 1 else "max_len"
+    else:
+        attention_rows = dp_requests
+        mlp_aligned_rows, model_rows, dp_padding_mode = (
+            _blackwell_decode_model_rows(
+                dp_requests=dp_requests,
+                hardware=hardware,
+                decode_cuda_graph_replay=decode_cuda_graph_replay,
+            )
+        )
+
+    if any(rows % hardware.attention_tp_size for rows in model_rows):
+        raise AssertionError("K3 MLP-sync rows must be attention-TP aligned.")
+    source_rows = tuple(
+        rows // hardware.attention_tp_size for rows in model_rows
+    )
+    global_model_rows = sum(model_rows)
+    sent_pairs = tuple(
+        rows * KIMI_K3_TEXT_CONFIG.num_experts_per_token for rows in source_rows
+    )
+    routed_pairs = global_model_rows * KIMI_K3_TEXT_CONFIG.num_experts_per_token
+    if routed_pairs % hardware.ep_size:
+        raise AssertionError("Balanced K3 routed pairs must divide the EP group.")
+    balanced_received_pairs = routed_pairs // hardware.ep_size
+    if hardware.family == "b300" and hardware.tp_size <= 8:
+        topology_contract = (
+            "All selected ranks stay inside one eight-GPU NVLink domain; no "
+            "scale-out fabric is traversed."
+        )
+    elif hardware.family == "b300":
+        topology_contract = (
+            "Eight-GPU NVLink domains plus the configured per-GPU scale-out fabric."
+        )
+    else:
+        topology_contract = (
+            "All selected ranks must share one healthy NVL72 L1 NVLink domain."
+        )
+    return ParallelWorkLedger(
+        attention_tp_size=hardware.attention_tp_size,
+        attention_dp_size=hardware.attention_dp_size,
+        dp_real_requests=dp_requests,
+        dp_mlp_aligned_rows=mlp_aligned_rows,
+        dp_model_rows=model_rows,
+        dp_padding_mode=dp_padding_mode,
+        source_rows_per_attention_rank=source_rows,
+        critical_attention_rows=max(attention_rows),
+        critical_model_rows=max(model_rows),
+        global_model_rows=global_model_rows,
+        routed_pair_instances=routed_pairs,
+        sent_pairs_per_attention_rank_by_dp=sent_pairs,
+        critical_sent_pairs_per_source_rank=max(sent_pairs),
+        balanced_received_pairs_per_ep_rank=balanced_received_pairs,
+        bound_condition_id="balanced_dp_fractional_uniform_ep_routing",
+        bound_condition=(
+            "Every derived Blackwell certificate and the latency result are "
+            "conditional on balanced request assignment across attention-DP "
+            "replicas and a fractional ideal-routing relaxation with uniform "
+            "EP destinations. This is a scenario assumption, not a claim about "
+            "realized per-step routes. The collective DAG assumes the public "
+            "default SGLANG_K3_SP_ATTN_RES=0; cross-layer shard carry is outside "
+            "this scenario."
+        ),
+        topology_contract=topology_contract,
+        excluded_positive_term_ids=(
+            "megamoe_alignment_padding",
+            "topk_compute",
+            "predispatch_quant_compute",
+            "expert_activation_compute",
+            "megamoe_internal_hbm_traffic",
+            "fp8_scale_transport",
+            "megamoe_control_metadata",
+            "megamoe_symmetric_buffer_copies",
+            "megamoe_transformed_weight_workspace",
+            "fabric_contention",
+            "collective_startup",
+        ),
+        notes=(
+            "The request batch is global to the engine and is assigned to DP replicas as evenly as whole requests allow.",
+            "SGLang MLP-sync first aligns every DP replica to attention TP8, then applies SUM_LEN or MAX_LEN DP padding; decode CUDA graphs use one common MAX_LEN capture shape.",
+            "Mandatory MLP-sync alignment makes every modeled MoE forward use the recipe's SP reduce-scatter/all-gather path.",
+            "The public default SGLANG_K3_SP_ATTN_RES=0 is fixed for this ledger; enabling cross-layer shard carry changes the DAG.",
+            "Received pairs and fabric traffic use the explicit fractional uniform-destination routing scenario; routing locality or skew can move traffic between fabrics and is not classified as a positive excluded cost.",
+        ),
+    )
+
+
+def _critical_dp_workload(
+    workload: Workload, ledger: ParallelWorkLedger | None
+) -> Workload:
+    if ledger is None:
+        return workload
+    critical_requests = max(ledger.dp_real_requests)
+    if workload.phase == "prefill":
+        return Workload(
+            phase="prefill",
+            batch_size=critical_requests,
+            sequence_length=workload.sequence_length,
+        )
+    return Workload(
+        phase="decode",
+        batch_size=critical_requests,
+        context_length=workload.context_length,
+        execution_batch_size=ledger.critical_model_rows,
     )
 
 
@@ -2710,22 +3604,42 @@ def _resolve_execution_workload(
     workload: Workload,
     hardware: HardwareSpec,
     assumptions: EstimatorAssumptions,
-) -> tuple[Workload, bool]:
+) -> tuple[Workload, bool, ParallelWorkLedger | None]:
     if workload.phase != "decode":
-        return workload, False
+        return (
+            workload,
+            False,
+            _parallel_work_ledger(
+                workload=workload,
+                hardware=hardware,
+                decode_cuda_graph_replay=False,
+            ),
+        )
 
+    critical_batch_size = math.ceil(
+        workload.batch_size / hardware.attention_dp_size
+    )
     graph_replay = (
         assumptions.decode_cuda_graph
-        and workload.batch_size <= hardware.decode_cuda_graph_max_batch_size
+        and critical_batch_size <= hardware.decode_cuda_graph_max_batch_size
+    )
+    work_ledger = _parallel_work_ledger(
+        workload=workload,
+        hardware=hardware,
+        decode_cuda_graph_replay=graph_replay,
     )
     execution_batch_size = workload.batch_size
-    if graph_replay:
-        execution_batch_size = next(
-            bucket
-            for bucket in hardware.decode_cuda_graph_batch_sizes
-            if bucket >= workload.batch_size
+    if work_ledger is not None:
+        execution_batch_size = work_ledger.global_model_rows
+    elif graph_replay:
+        execution_batch_size = _captured_batch_size(
+            workload.batch_size, hardware
         )
-    return replace(workload, execution_batch_size=execution_batch_size), graph_replay
+    return (
+        replace(workload, execution_batch_size=execution_batch_size),
+        graph_replay,
+        work_ledger,
+    )
 
 
 def estimate(
@@ -2760,7 +3674,11 @@ def estimate(
         HARDWARE_PRESETS[hardware] if isinstance(hardware, str) else hardware
     )
     resolved_hardware.validate()
-    execution_workload, decode_cuda_graph_replay = _resolve_execution_workload(
+    (
+        execution_workload,
+        decode_cuda_graph_replay,
+        work_ledger,
+    ) = _resolve_execution_workload(
         workload=workload,
         hardware=resolved_hardware,
         assumptions=assumptions,
@@ -2768,12 +3686,18 @@ def estimate(
     execution_assumptions = replace(
         assumptions, decode_cuda_graph=decode_cuda_graph_replay
     )
+    rank_workload = _critical_dp_workload(execution_workload, work_ledger)
+    prefill_rows = (
+        work_ledger.critical_attention_rows
+        if work_ledger is not None
+        else workload.token_count
+    )
     if (
         workload.phase == "prefill"
-        and workload.token_count > resolved_hardware.prefill_chunk_size
+        and prefill_rows > resolved_hardware.prefill_chunk_size
     ):
         raise ValueError(
-            f"Cold-prefill batch has {workload.token_count} tokens, exceeding "
+            f"Cold-prefill critical DP replica has {prefill_rows} tokens, exceeding "
             f"{resolved_hardware.id}'s {resolved_hardware.prefill_chunk_size}-token "
             "single-forward chunk. Multi-chunk cached-prefix/extend MLA is not "
             "modeled yet."
@@ -2781,41 +3705,48 @@ def estimate(
 
     layers: list[LayerEstimate] = [
         _embedding_layer(
-            workload=execution_workload,
+            workload=rank_workload,
             config=config,
             hardware=resolved_hardware,
             assumptions=execution_assumptions,
+            work_ledger=work_ledger,
         )
     ]
     layers.extend(
         _decoder_layer(
             layer=layer,
-            workload=execution_workload,
+            workload=rank_workload,
             config=config,
             hardware=resolved_hardware,
             assumptions=execution_assumptions,
+            work_ledger=work_ledger,
         )
         for layer in config.layers()
     )
     layers.append(
         _final_norm_layer(
-            workload=execution_workload,
+            workload=rank_workload,
             config=config,
             hardware=resolved_hardware,
             assumptions=execution_assumptions,
+            work_ledger=work_ledger,
         )
     )
     layers.append(
         _lm_head_layer(
-            workload=execution_workload,
+            workload=rank_workload,
             config=config,
             hardware=resolved_hardware,
             assumptions=execution_assumptions,
+            work_ledger=work_ledger,
         )
     )
     total = sum(layer.latency_seconds for layer in layers)
     memory = _memory_estimate(
-        workload=execution_workload, config=config, hardware=resolved_hardware
+        workload=rank_workload,
+        config=config,
+        hardware=resolved_hardware,
+        work_ledger=work_ledger,
     )
     runtime_warnings: tuple[str, ...] = ()
     if resolved_hardware.k3_fused_all_reduce_capable:
@@ -2852,13 +3783,20 @@ def estimate(
                 "Decode CUDA-graph overlap is disabled; projections/gates are serialized.",
             )
 
+    moe_accounting_warning = (
+        "Blackwell routed-pair balance is conditional; its HBM certificate uses "
+        "a deterministic one-expert floor and excludes expected occupancy."
+        if resolved_hardware.uses_moe_a2a
+        else "MoE expert-weight traffic uses only the deterministic minimum "
+        "number of active experts; routing occupancy above that is excluded."
+    )
     warnings = (
-        "This is an optimistic analytical lower bound, not a latency prediction or benchmark result.",
+        "This is a conditional analytical lower bound, not a latency prediction or benchmark result.",
         f"SGLang recipe status: {resolved_hardware.recipe_status}.",
         "Default compute/HBM/collective efficiencies are 100% and collective startup latency is zero.",
         "No CUDA launch, scheduler, sampling, CPU, network-software, or straggler overhead is included.",
-        "MoE routing is assumed uniform and perfectly balanced; expert-weight occupancy is an expectation.",
-        "Attention HBM traffic is a logical minimum and may undercount backend-specific rereads.",
+        moe_accounting_warning,
+        "HBM-demand certificates assume counted logical reads and writes materialize through HBM; cache residency or fusion changes this scenario, while backend rereads are excluded.",
         "Prefill is constrained to one real SGLang chunk; multi-chunk cached-prefix extend is not modeled.",
         "Accounted peak memory includes persistent absorbed weights, synthetic expert biases, and the eight-row attention-residual bank, but excludes allocator reserve, CUDA-graph pools, workspaces, other live activations, and SGLang's extra KDA state slots.",
         *runtime_warnings,
@@ -2875,6 +3813,7 @@ def estimate(
         workload=execution_workload,
         assumptions=assumptions,
         decode_cuda_graph_replay=decode_cuda_graph_replay,
+        parallel_work_ledger=work_ledger,
         layers=tuple(layers),
         total_seconds=total,
         memory=memory,
