@@ -156,7 +156,7 @@
                 />
                 <span>
                   <strong>H200</strong>
-                  <small>TP8 · TP16/EP16 · TP32/EP32</small>
+                  <small>TP and matched TP+EP · 8 / 16 / 32 ranks</small>
                 </span>
               </label>
               <label class="choice-option">
@@ -169,7 +169,7 @@
                 />
                 <span>
                   <strong>B300</strong>
-                  <small>Scale-out · IB 100 GB/s</small>
+                  <small>TP and matched TP+EP · 8 / 16 / 32 ranks</small>
                 </span>
               </label>
               <label class="choice-option">
@@ -182,22 +182,25 @@
                 />
                 <span>
                   <strong>GB300</strong>
-                  <small>NVL72 fabric</small>
+                  <small>TP and matched TP+EP · 8 / 16 / 32 ranks</small>
                 </span>
               </label>
             </div>
           </fieldset>
 
-          <fieldset class="control-group choice-group tp-group">
-            <legend>Tensor / H200 Expert parallel size</legend>
-            <div class="choice-grid tp-options">
+          <fieldset class="control-group choice-group sharding-group">
+            <legend>Sharding scenario</legend>
+            <div class="choice-grid sharding-options">
               <label class="choice-option compact-option">
                 <input
                   type="radio"
-                  name="tp-size"
-                  value="8"
+                  name="sharding"
+                  value="tp8"
+                  data-tp-size="8"
+                  data-moe-sharding="tp"
                   checked
-                  data-testid="tp-size-8"
+                  data-testid="sharding-tp8"
+                  aria-describedby="sharding-option-tp8-support"
                 />
                 <span class="parallel-pair">
                   <span class="parallel-dimension" data-dimension="tp">
@@ -208,14 +211,96 @@
                     <small>EP</small>
                     <strong>off</strong>
                   </span>
+                  <span
+                    class="sr-only sharding-option-support"
+                    id="sharding-option-tp8-support"
+                  >Loading sharding support.</span>
                 </span>
               </label>
               <label class="choice-option compact-option">
                 <input
                   type="radio"
-                  name="tp-size"
-                  value="16"
-                  data-testid="tp-size-16"
+                  name="sharding"
+                  value="tp16"
+                  data-tp-size="16"
+                  data-moe-sharding="tp"
+                  data-testid="sharding-tp16"
+                  aria-describedby="sharding-option-tp16-support"
+                />
+                <span class="parallel-pair">
+                  <span class="parallel-dimension" data-dimension="tp">
+                    <small>TP</small>
+                    <strong>16</strong>
+                  </span>
+                  <span class="parallel-dimension" data-dimension="ep">
+                    <small>EP</small>
+                    <strong>off</strong>
+                  </span>
+                  <span
+                    class="sr-only sharding-option-support"
+                    id="sharding-option-tp16-support"
+                  >Loading sharding support.</span>
+                </span>
+              </label>
+              <label class="choice-option compact-option">
+                <input
+                  type="radio"
+                  name="sharding"
+                  value="tp32"
+                  data-tp-size="32"
+                  data-moe-sharding="tp"
+                  data-testid="sharding-tp32"
+                  aria-describedby="sharding-option-tp32-support"
+                />
+                <span class="parallel-pair">
+                  <span class="parallel-dimension" data-dimension="tp">
+                    <small>TP</small>
+                    <strong>32</strong>
+                  </span>
+                  <span class="parallel-dimension" data-dimension="ep">
+                    <small>EP</small>
+                    <strong>off</strong>
+                  </span>
+                  <span
+                    class="sr-only sharding-option-support"
+                    id="sharding-option-tp32-support"
+                  >Loading sharding support.</span>
+                </span>
+              </label>
+              <label class="choice-option compact-option">
+                <input
+                  type="radio"
+                  name="sharding"
+                  value="tp8+ep8"
+                  data-tp-size="8"
+                  data-moe-sharding="ep"
+                  data-testid="sharding-tp8-ep8"
+                  aria-describedby="sharding-option-tp8-ep8-support"
+                />
+                <span class="parallel-pair">
+                  <span class="parallel-dimension" data-dimension="tp">
+                    <small>TP</small>
+                    <strong>8</strong>
+                  </span>
+                  <span class="parallel-dimension" data-dimension="ep">
+                    <small>EP</small>
+                    <strong>8</strong>
+                  </span>
+                  <span
+                    class="sr-only sharding-option-support"
+                    id="sharding-option-tp8-ep8-support"
+                  >Loading sharding support.</span>
+                </span>
+              </label>
+              <label class="choice-option compact-option">
+                <input
+                  type="radio"
+                  name="sharding"
+                  value="tp16+ep16"
+                  data-tp-size="16"
+                  data-moe-sharding="ep"
+                  data-testid="sharding-tp16-ep16"
+                  aria-describedby="sharding-option-tp16-ep16-support"
                 />
                 <span class="parallel-pair">
                   <span class="parallel-dimension" data-dimension="tp">
@@ -226,44 +311,51 @@
                     <small>EP</small>
                     <strong>16</strong>
                   </span>
+                  <span
+                    class="sr-only sharding-option-support"
+                    id="sharding-option-tp16-ep16-support"
+                  >Loading sharding support.</span>
                 </span>
               </label>
               <label class="choice-option compact-option">
-                <input type="radio" name="tp-size" value="32" data-testid="tp-size-32" />
-                <span class="parallel-pair">
-                  <span class="parallel-dimension" data-dimension="tp">
-                    <small>TP</small>
-                    <strong>32</strong>
-                  </span>
-                  <span class="parallel-dimension" data-dimension="ep">
-                    <small>EP</small>
-                    <strong>32</strong>
-                  </span>
-                </span>
-              </label>
-              <label class="choice-option compact-option unsupported-option">
                 <input
                   type="radio"
-                  name="tp-size"
-                  value="64"
-                  disabled
-                  data-testid="tp-size-64"
+                  name="sharding"
+                  value="tp32+ep32"
+                  data-tp-size="32"
+                  data-moe-sharding="ep"
+                  data-testid="sharding-tp32-ep32"
+                  aria-describedby="sharding-option-tp32-ep32-support"
                 />
                 <span class="parallel-pair">
                   <span class="parallel-dimension" data-dimension="tp">
                     <small>TP</small>
-                    <strong>64</strong>
+                    <strong>32</strong>
                   </span>
                   <span class="parallel-dimension" data-dimension="ep">
                     <small>EP</small>
-                    <strong>—</strong>
+                    <strong>32</strong>
                   </span>
+                  <span
+                    class="sr-only sharding-option-support"
+                    id="sharding-option-tp32-ep32-support"
+                  >Loading sharding support.</span>
                 </span>
               </label>
             </div>
-            <p class="field-help tp-help">
-              EP labels apply to the H200 recipe. B300 and GB300 remain EP off.
-              TP64 is unavailable: 96 attention heads are not divisible by 64.
+            <p class="field-help sharding-definition">
+              TP<em>N</em>+EP<em>N</em> uses the same <em>N</em> ranks, not
+              <em>N</em>² GPUs. Execution is hardware-specific: H200 uses its
+              no-A2A Marlin path; B300/GB300 use attention TP8 × DP<em>N</em>/8,
+              SP-MoE, MegaMoE A2A, and DeepGEMM.
+            </p>
+            <p
+              class="field-help sharding-help"
+              id="sharding-support"
+              role="status"
+              aria-live="polite"
+            >
+              Loading sharding support…
             </p>
           </fieldset>
 
@@ -331,7 +423,7 @@
               <div>
                 <p class="section-number">01</p>
                 <h3 id="executive-title">Executive comparison</h3>
-                <p>End-to-end model time across the selected GPU families at one TP size.</p>
+                <p>End-to-end latency lower bound across the selected GPU families at one sharding scenario.</p>
               </div>
             </div>
             <div class="comparison-cards" id="comparison-cards" data-testid="comparison-cards"></div>
@@ -340,8 +432,8 @@
                 <thead>
                   <tr>
                     <th scope="col">System</th>
-                    <th scope="col">TP size</th>
-                    <th scope="col" class="numeric">Model time</th>
+                    <th scope="col">Sharding</th>
+                    <th scope="col" class="numeric">Latency lower bound</th>
                     <th scope="col" class="numeric">Ideal throughput</th>
                     <th scope="col" class="numeric">Weights / GPU</th>
                     <th scope="col" class="numeric">Peak / GPU</th>
@@ -358,50 +450,45 @@
             <div class="section-heading heading-with-control">
               <div>
                 <p class="section-number">02</p>
-                <h3 id="breakdown-title">Where the time goes</h3>
-                <p>Exact stage latency, plus independent non-additive resource floors.</p>
+                <h3 id="breakdown-title">Latency lower-bound decomposition</h3>
+                <p>Exact stage contributions, plus overlapping whole-model certificates.</p>
               </div>
               <label class="select-label" for="breakdown-hardware">
                 <span class="sr-only">Hardware for breakdown</span>
                 <select id="breakdown-hardware"></select>
               </label>
             </div>
-            <div class="breakdown-grid">
-              <article class="chart-card stage-card">
-                <div class="card-heading">
-                  <div>
-                    <h4>Stage contribution</h4>
-                    <p>These mutually exclusive stage totals add to model time.</p>
-                  </div>
-                  <strong id="stage-total"></strong>
+            <article class="chart-card stage-card">
+              <div class="card-heading">
+                <div>
+                  <h4>Stage contribution to the latency lower bound</h4>
+                  <p>These mutually exclusive stage contributions add to the latency lower bound.</p>
                 </div>
-                <div class="stacked-bar" id="stage-stacked-bar" role="img" aria-label="Latency contribution by stage"></div>
-                <div class="breakdown-legend" id="stage-legend"></div>
-              </article>
-
-              <article class="chart-card floor-card">
-                <div class="card-heading">
-                  <div>
-                    <h4>Layer limiting floors</h4>
-                    <p>Count of stages whose final bound is set by each floor.</p>
-                  </div>
-                </div>
-                <div class="floor-chart" id="floor-chart"></div>
-              </article>
-            </div>
+                <strong id="stage-total"></strong>
+              </div>
+              <div class="stacked-bar" id="stage-stacked-bar" role="img" aria-label="Latency lower-bound contribution by stage"></div>
+              <div class="breakdown-legend" id="stage-legend"></div>
+            </article>
 
             <article class="chart-card resource-card">
               <div class="card-heading">
                 <div>
-                  <h4>Aggregate resource-floor comparison</h4>
+                  <h4>Whole-model lower-bound certificates</h4>
                   <p>
-                    Compute, memory-bandwidth, communication, and dependency floors
-                    overlap. They are diagnostics and must not be added together.
+                    Each bar sums one certificate across all stages. The certificates
+                    overlap and must not be added together.
                   </p>
                 </div>
-                <span class="diagnostic-badge">Non-additive</span>
+                <span class="diagnostic-badge">Overlapping · non-additive</span>
               </div>
               <div class="resource-bars" id="resource-bars"></div>
+              <div class="certificate-total">
+                <div>
+                  <span>Latency lower bound</span>
+                  <small>Σstage max(critical path, compute demand, HBM demand, communication demand)</small>
+                </div>
+                <strong id="certificate-latency-total"></strong>
+              </div>
             </article>
           </section>
 
@@ -494,7 +581,7 @@
                 <span id="layer-chart-summary"></span>
               </div>
               <div class="canvas-wrap">
-                <canvas id="layer-chart" height="320" data-testid="layer-chart" role="img" aria-label="Model-stage latency chart">Model-stage latency is also available in the table below.</canvas>
+                <canvas id="layer-chart" height="320" data-testid="layer-chart" role="img" aria-label="Model-stage latency lower-bound chart">Model-stage latency lower bounds are also available in the table below.</canvas>
                 <div class="chart-tooltip" id="chart-tooltip" role="status" hidden></div>
               </div>
             </article>
@@ -516,10 +603,10 @@
                     <th scope="col" aria-label="Expand"></th>
                     <th scope="col">Stage</th>
                     <th scope="col">Path</th>
-                    <th scope="col" class="numeric">Latency</th>
+                    <th scope="col" class="numeric">Latency lower bound</th>
                     <th scope="col" class="numeric">Share</th>
                     <th scope="col">Dominant operation</th>
-                    <th scope="col">Layer floor</th>
+                    <th scope="col">Layer lower-bound certificate(s)</th>
                   </tr>
                 </thead>
                 <tbody id="layer-table-body"></tbody>
@@ -527,9 +614,10 @@
             </div>
             <p class="table-note">
               Select any operator to reveal the formula, substituted values, units,
-              and result behind every numeric field. Operator rooflines inside a layer
-              can overlap; layer time is the maximum of the dependency schedule and
-              aggregate compute, memory-bandwidth, and communication resource floors.
+              and result behind every numeric field. Operator rooflines inside a stage
+              can overlap; the stage latency lower bound is the maximum of its critical
+              path and aggregate compute-, HBM-, and communication-demand certificates.
+              Exact ties display every co-limiting certificate.
             </p>
           </section>
 

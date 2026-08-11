@@ -22,7 +22,10 @@ from typing import Any, Sequence
 from urllib.parse import unquote, urlsplit
 
 _PRIVATE_PACKAGE_NAME = "_sglang_kimi_k3_calculator_analyzer"
-_ANALYTICAL_STATUS = "optimistic lower bound; not measured"
+_ANALYTICAL_STATUS = (
+    "conditional analytical lower bound under logical HBM materialization; "
+    "not measured"
+)
 _MAX_REQUEST_BYTES = 1 << 20
 _MAX_BATCH_SIZE = 4096
 STATIC_DIR = Path(__file__).resolve().with_suffix("")
@@ -32,6 +35,7 @@ _REQUEST_FIELDS = frozenset(
         "phase",
         "hardware",
         "tp_size",
+        "moe_sharding",
         "sequence_length",
         "batch_size",
         "context_length",
@@ -43,6 +47,16 @@ _REQUEST_FIELDS = frozenset(
         "decode_cuda_graph",
         "blackwell_k3_fused_all_reduce",
     }
+)
+
+_SHARDING_OPTIONS = tuple(
+    (
+        f"tp{tp_size}" if moe_sharding == "tp" else f"tp{tp_size}+ep{tp_size}",
+        tp_size,
+        moe_sharding,
+    )
+    for moe_sharding in ("tp", "ep")
+    for tp_size in (8, 16, 32)
 )
 
 
@@ -176,6 +190,42 @@ def _tp_size(payload: dict[str, Any], analyzer: ModuleType) -> int:
     return value
 
 
+def _moe_sharding(payload: dict[str, Any]) -> str | None:
+    if "moe_sharding" not in payload:
+        return None
+    value = payload["moe_sharding"]
+    if value not in ("tp", "ep"):
+        raise ApiError("invalid_request", "moe_sharding must be 'tp' or 'ep'.")
+    return value
+
+
+def _sharding_label(tp_size: int, moe_sharding: str) -> str:
+    return (
+        f"TP{tp_size}"
+        if moe_sharding == "tp"
+        else f"TP{tp_size}+EP{tp_size}"
+    )
+
+
+def _sharding_support(
+    family: str,
+    tp_size: int,
+    moe_sharding: str,
+    analyzer: ModuleType | None = None,
+) -> dict[str, str]:
+    support = {"status": "modeled"}
+    if analyzer is not None:
+        hardware = analyzer.make_calculator_hardware(
+            family, tp_size, moe_sharding=moe_sharding
+        )
+        if (
+            analyzer.static_weight_bytes_per_rank(hardware)
+            > hardware.nominal_hbm_capacity_bytes_per_gpu
+        ):
+            support["capacity_hint"] = "static_weights_exceed_nominal_hbm"
+    return support
+
+
 def _hardware_specs(
     payload: dict[str, Any], analyzer: ModuleType
 ) -> tuple[object, ...]:
@@ -199,9 +249,12 @@ def _hardware_specs(
     legacy = set(analyzer.HARDWARE_PRESETS)
     if all(item in families for item in requested):
         tp_size = _tp_size(payload, analyzer)
+        moe_sharding = _moe_sharding(payload)
         try:
             return tuple(
-                analyzer.make_calculator_hardware(family, tp_size)
+                analyzer.make_calculator_hardware(
+                    family, tp_size, moe_sharding=moe_sharding
+                )
                 for family in requested
             )
         except ValueError as error:
@@ -210,10 +263,11 @@ def _hardware_specs(
     # Keep the original fixed-preset request form available to scripts that
     # predate the calculator's independent hardware/TP controls.
     if all(item in legacy for item in requested):
-        if "tp_size" in payload:
+        if "tp_size" in payload or "moe_sharding" in payload:
             raise ApiError(
                 "invalid_request",
-                "tp_size cannot be combined with legacy fixed hardware preset IDs.",
+                "tp_size and moe_sharding cannot be combined with legacy fixed "
+                "hardware preset IDs.",
             )
         return tuple(analyzer.HARDWARE_PRESETS[item] for item in requested)
 
@@ -279,6 +333,27 @@ def _normalized_request(
             payload, "blackwell_k3_fused_all_reduce", True
         ),
     )
+    strict_values = {
+        "compute_efficiency": assumptions.compute_efficiency,
+        "hbm_efficiency": assumptions.hbm_efficiency,
+        "collective_efficiency": assumptions.collective_efficiency,
+        "collective_startup_us": assumptions.collective_startup_seconds * 1e6,
+        "mla_kv_read_amplification": assumptions.mla_kv_read_amplification,
+    }
+    expected_values = {
+        "compute_efficiency": 1.0,
+        "hbm_efficiency": 1.0,
+        "collective_efficiency": 1.0,
+        "collective_startup_us": 0.0,
+        "mla_kv_read_amplification": 1.0,
+    }
+    if strict_values != expected_values:
+        raise ApiError(
+            "invalid_request",
+            "Lower-bound certificate mode requires compute_efficiency=1, "
+            "hbm_efficiency=1, collective_efficiency=1, "
+            "collective_startup_us=0, and mla_kv_read_amplification=1.",
+        )
     hardware_specs = _hardware_specs(payload, analyzer)
     return workload, assumptions, hardware_specs
 
@@ -305,7 +380,7 @@ def manifest_payload(analyzer: ModuleType | None = None) -> dict[str, Any]:
 
     analyzer = analyzer or _load_analyzer()
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "analytical_status": _ANALYTICAL_STATUS,
         "model": _calculator_model(analyzer),
         "hardware_presets": {
@@ -319,43 +394,53 @@ def manifest_payload(analyzer: ModuleType | None = None) -> dict[str, Any]:
                     "b300": "B300",
                     "gb300": "GB300",
                 }[family],
-                "gpu": analyzer.make_calculator_hardware(family, 8).gpu,
+                "gpu": analyzer.make_calculator_hardware(
+                    family, 8, moe_sharding="tp"
+                ).gpu,
                 "gpus_per_node": analyzer.make_calculator_hardware(
-                    family, 8
+                    family, 8, moe_sharding="tp"
                 ).gpus_per_node,
                 "nvlink_domain_size": analyzer.make_calculator_hardware(
-                    family, 8
+                    family, 8, moe_sharding="tp"
                 ).nvlink_domain_size,
                 "nvlink_bytes_per_s_per_direction": analyzer.make_calculator_hardware(
-                    family, 8
+                    family, 8, moe_sharding="tp"
                 ).nvlink_bytes_per_s_per_direction,
                 "scaleout_bytes_per_s_per_gpu_per_direction": analyzer.make_calculator_hardware(
-                    family, 8
+                    family, 8, moe_sharding="tp"
                 ).scaleout_bytes_per_s_per_gpu_per_direction,
                 "prefill_chunk_size": analyzer.make_calculator_hardware(
-                    family, 8
+                    family, 8, moe_sharding="tp"
                 ).prefill_chunk_size,
                 "decode_cuda_graph_max_batch_size": analyzer.make_calculator_hardware(
-                    family, 8
+                    family, 8, moe_sharding="tp"
                 ).decode_cuda_graph_max_batch_size,
             }
             for family in analyzer.CALCULATOR_HARDWARE_FAMILIES
         },
         "tp_sizes": list(analyzer.CALCULATOR_TP_SIZES),
-        "invalid_combinations": [
+        "sharding_options": [
             {
-                "hardware": list(analyzer.CALCULATOR_HARDWARE_FAMILIES),
-                "tp_size": 64,
-                "reason": (
-                    "TP64 is not supported by Kimi-K3 because 96 KDA "
-                    "attention heads do not divide evenly across 64 ranks."
-                ),
+                "id": option_id,
+                "label": _sharding_label(tp_size, moe_sharding),
+                "tp_size": tp_size,
+                "ep_size": tp_size if moe_sharding == "ep" else 1,
+                "moe_sharding": moe_sharding,
+                "families": {
+                    family: _sharding_support(
+                        family, tp_size, moe_sharding, analyzer
+                    )
+                    for family in analyzer.CALCULATOR_HARDWARE_FAMILIES
+                },
             }
+            for option_id, tp_size, moe_sharding in _SHARDING_OPTIONS
         ],
+        "invalid_combinations": [],
         "defaults": {
             "phase": "prefill",
             "hardware": ["all"],
             "tp_size": 8,
+            "moe_sharding": "tp",
             "sequence_length": 4096,
             "batch_size": 1,
             "context_length": 4096,
@@ -381,10 +466,14 @@ def calculate_payload(
     assumptions.validate()
     if workload.phase == "prefill":
         for hardware in hardware_specs:
-            if workload.token_count > hardware.prefill_chunk_size:
+            critical_tokens = (
+                math.ceil(workload.batch_size / hardware.attention_dp_size)
+                * int(workload.sequence_length or 0)
+            )
+            if critical_tokens > hardware.prefill_chunk_size:
                 raise ApiError(
                     "invalid_request",
-                    f"Cold-prefill batch has {workload.token_count} tokens, exceeding "
+                    f"Cold-prefill critical DP replica has {critical_tokens} tokens, exceeding "
                     f"{hardware.id}'s {hardware.prefill_chunk_size}-token "
                     "single-forward chunk. Multi-chunk cached-prefix/extend MLA is "
                     "not modeled yet.",
@@ -401,7 +490,7 @@ def calculate_payload(
         for hardware in hardware_specs
     ]
     response = {
-        "schema_version": 1,
+        "schema_version": 2,
         "analytical_status": _ANALYTICAL_STATUS,
         "model": _calculator_model(analyzer),
         "results": results,

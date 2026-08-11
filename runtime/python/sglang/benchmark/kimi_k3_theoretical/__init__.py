@@ -9,8 +9,10 @@ from .estimator import (
     CalculationProvenance,
     EstimateResult,
     EstimatorAssumptions,
+    ParallelWorkLedger,
     Workload,
     estimate,
+    static_weight_bytes_per_rank,
 )
 from .specs import (
     CALCULATOR_HARDWARE_FAMILIES,
@@ -20,6 +22,7 @@ from .specs import (
     HardwareSpec,
     KimiK3TextConfig,
     make_calculator_hardware,
+    make_ep_hardware,
     make_tp_hardware,
 )
 
@@ -33,8 +36,11 @@ __all__ = [
     "EstimatorAssumptions",
     "HardwareSpec",
     "KimiK3TextConfig",
+    "ParallelWorkLedger",
     "Workload",
     "estimate",
     "make_calculator_hardware",
+    "make_ep_hardware",
     "make_tp_hardware",
+    "static_weight_bytes_per_rank",
 ]

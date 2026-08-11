@@ -22,6 +22,8 @@ jobs:
         uses: actions/checkout@v6
       - name: Test runtime
         run: python3 -m unittest discover -s tests
+      - name: Test browser contracts
+        run: node --test tests/site_contracts_test.js
       - name: Build static site
         run: bash scripts/build_site.sh
       - name: Configure Pages

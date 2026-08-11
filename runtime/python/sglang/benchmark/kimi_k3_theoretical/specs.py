@@ -220,6 +220,8 @@ class HardwareSpec:
     node_count: int
     gpus_per_node: int
     tp_size: int
+    attention_tp_size: int
+    attention_dp_size: int
     ep_size: int
     moe_sharding: MoeSharding
     nominal_hbm_capacity_bytes_per_gpu: int
@@ -230,6 +232,11 @@ class HardwareSpec:
     nvlink_domain_size: int
     scaleout_bytes_per_s_per_gpu_per_direction: float | None
     moe_backend: str
+    moe_a2a_backend: str | None
+    sp_moe: bool
+    dp_lm_head: bool
+    kv_cache_bytes_per_element: float
+    kda_state_bytes_per_element: float
     mla_prefill_backend: str
     mla_decode_backend: str
     prefill_chunk_size: int
@@ -244,9 +251,27 @@ class HardwareSpec:
 
     @property
     def local_attention_heads(self) -> int:
-        if KIMI_K3_TEXT_CONFIG.num_attention_heads % self.tp_size:
-            raise ValueError("Attention heads are not divisible by TP size.")
-        return KIMI_K3_TEXT_CONFIG.num_attention_heads // self.tp_size
+        if KIMI_K3_TEXT_CONFIG.num_attention_heads % self.attention_tp_size:
+            raise ValueError("Attention heads are not divisible by attention TP size.")
+        return KIMI_K3_TEXT_CONFIG.num_attention_heads // self.attention_tp_size
+
+    @property
+    def uses_moe_a2a(self) -> bool:
+        return self.moe_a2a_backend is not None
+
+    @property
+    def execution_contract_id(self) -> str:
+        if self.uses_moe_a2a:
+            return "kimi_k3_blackwell_megamoe_sp_v1"
+        return "kimi_k3_plain_tp_or_h200_ep_v1"
+
+    @property
+    def shared_expert_tp_size(self) -> int:
+        return 1 if self.uses_moe_a2a else self.tp_size
+
+    @property
+    def lm_head_tp_size(self) -> int:
+        return self.attention_tp_size if self.dp_lm_head else self.tp_size
 
     @property
     def moe_shard_size(self) -> int:
@@ -293,8 +318,14 @@ class HardwareSpec:
             raise ValueError(f"{self.id}: node/GPU topology is inconsistent.")
         if self.tp_size != self.gpu_count:
             raise ValueError(f"{self.id}: scoped presets require TP == GPU count.")
-        if KIMI_K3_TEXT_CONFIG.num_attention_heads % self.tp_size:
-            raise ValueError(f"{self.id}: TP does not divide 96 attention heads.")
+        if self.attention_tp_size * self.attention_dp_size != self.tp_size:
+            raise ValueError(
+                f"{self.id}: attention TP × attention DP must equal global TP."
+            )
+        if KIMI_K3_TEXT_CONFIG.num_attention_heads % self.attention_tp_size:
+            raise ValueError(
+                f"{self.id}: attention TP does not divide 96 attention heads."
+            )
         if (
             self.moe_sharding == "tp"
             and KIMI_K3_TEXT_CONFIG.moe_intermediate_size % self.tp_size
@@ -315,10 +346,37 @@ class HardwareSpec:
             )
         if self.moe_sharding == "ep" and KIMI_K3_TEXT_CONFIG.num_experts % self.ep_size:
             raise ValueError(f"{self.id}: EP does not divide 896 routed experts.")
+        if self.uses_moe_a2a:
+            if self.family not in ("b300", "gb300"):
+                raise ValueError(f"{self.id}: MegaMoE A2A is Blackwell-only here.")
+            if self.moe_sharding != "ep" or self.ep_size != self.tp_size:
+                raise ValueError(f"{self.id}: MegaMoE requires matched global TP/EP.")
+            if not self.sp_moe:
+                raise ValueError(f"{self.id}: K3 MegaMoE requires SP-MoE accounting.")
+            expected_gpus_per_node = 8 if self.family == "b300" else 4
+            if (
+                self.attention_tp_size != 8
+                or self.moe_backend != "DeepGEMM MegaMoE MXFP4 W4A8"
+                or self.moe_a2a_backend != "MegaMoE"
+                or self.dp_lm_head != (self.attention_dp_size > 1)
+                or self.kv_cache_bytes_per_element != 1.0
+                or self.kda_state_bytes_per_element != 2.0
+                or self.gpus_per_node != expected_gpus_per_node
+            ):
+                raise ValueError(
+                    f"{self.id}: fields do not satisfy "
+                    f"{self.execution_contract_id}."
+                )
+        elif self.sp_moe:
+            raise ValueError(f"{self.id}: SP-MoE requires an EP A2A backend.")
 
     def to_dict(self) -> dict:
         result = asdict(self)
         result["local_attention_heads"] = self.local_attention_heads
+        result["uses_moe_a2a"] = self.uses_moe_a2a
+        result["execution_contract_id"] = self.execution_contract_id
+        result["shared_expert_tp_size"] = self.shared_expert_tp_size
+        result["lm_head_tp_size"] = self.lm_head_tp_size
         result["moe_shard_size"] = self.moe_shard_size
         result["local_routed_experts"] = self.local_routed_experts
         result["routed_expert_intermediate_size_per_partition"] = (
@@ -336,7 +394,10 @@ _H200_SOURCE = Source(
 _DGX_H200_NETWORK_SOURCE = Source(
     title="NVIDIA DGX H100/H200 hardware overview",
     url=("https://docs.nvidia.com/dgx/dgxh100-user-guide/introduction-to-dgxh100.html"),
-    note="Eight 400 Gb/s ConnectX-7 cluster cards mapped one-to-one to GPUs.",
+    note=(
+        "Eight-GPU NVSwitch topology and eight 400 Gb/s ConnectX-7 cluster "
+        "cards mapped one-to-one to GPUs."
+    ),
 )
 _B300_SOURCE = Source(
     title="NVIDIA HGX B300 specifications",
@@ -363,6 +424,30 @@ _CUTLASS_SOURCE = Source(
     url="https://docs.nvidia.com/cutlass/latest/media/docs/cpp/blackwell_functionality.html",
     note="Mixed MXF8/MXF6/MXF4 MMA throughput class used for W4A8 derivation.",
 )
+_SGLANG_K3_RECIPE_SOURCE = Source(
+    title="SGLang Kimi-K3 cookbook",
+    url="https://docs.sglang.io/cookbook/autoregressive/Moonshotai/Kimi-K3",
+    note=(
+        "Defines the Blackwell Peak Throughput topology: global matched TP/EP, "
+        "attention TP8, DP=N/8, MegaMoE A2A, DeepGEMM, FP8 KV, and BF16 state."
+    ),
+)
+_SGLANG_K3_EXECUTION_SOURCE = Source(
+    title="Pinned SGLang Kimi-K3 execution path",
+    url=(
+        "https://github.com/sgl-project/sglang/blob/"
+        "ba7b810cc4be74623cf418c5467f29a8a39ac764/"
+        "python/sglang/srt/models/kimi_k3.py"
+    ),
+    note=(
+        "Pins SP-MoE reduce-scatter/all-gather, MegaMoE dispatch/combine, "
+        "TP1 shared experts, and the shared-overlap A/B comment."
+    ),
+)
+
+_H200_NDR400_DERIVATION = (
+    "The communication model assumes a DGX/HGX-style NDR400 HCA per GPU."
+)
 
 
 HARDWARE_PRESETS: dict[str, HardwareSpec] = {
@@ -375,6 +460,8 @@ HARDWARE_PRESETS: dict[str, HardwareSpec] = {
         node_count=2,
         gpus_per_node=8,
         tp_size=16,
+        attention_tp_size=16,
+        attention_dp_size=1,
         ep_size=16,
         moe_sharding="ep",
         # Vendor-nameplate capacity, not an exact NVML/CUDA allocatable byte count.
@@ -390,6 +477,11 @@ HARDWARE_PRESETS: dict[str, HardwareSpec] = {
         # Explicit reference-system assumption: one NDR400 HCA per GPU.
         scaleout_bytes_per_s_per_gpu_per_direction=50e9,
         moe_backend="marlin W4A16",
+        moe_a2a_backend=None,
+        sp_moe=False,
+        dp_lm_head=False,
+        kv_cache_bytes_per_element=2.0,
+        kda_state_bytes_per_element=4.0,
         mla_prefill_backend="FA3/MHA path (cold prefill)",
         mla_decode_backend="FlashMLA absorbed MLA",
         prefill_chunk_size=8192,
@@ -402,7 +494,7 @@ HARDWARE_PRESETS: dict[str, HardwareSpec] = {
         derivations=(
             "Dense BF16 is one half of NVIDIA's sparsity-marked 1,979 TF/s.",
             "Marlin W4A16 is bounded by the dense BF16/FP16 compute class.",
-            "The communication model assumes a DGX/HGX-style NDR400 HCA per GPU.",
+            _H200_NDR400_DERIVATION,
             "SGLang's H200 memory heuristic selects an 8192-token prefill chunk.",
             "SGLang's default non-speculative decode CUDA-graph maximum is 512 requests.",
         ),
@@ -422,6 +514,8 @@ HARDWARE_PRESETS: dict[str, HardwareSpec] = {
         node_count=1,
         gpus_per_node=8,
         tp_size=8,
+        attention_tp_size=8,
+        attention_dp_size=1,
         ep_size=1,
         moe_sharding="tp",
         # Vendor-nameplate capacity, not an exact NVML/CUDA allocatable byte count.
@@ -436,6 +530,11 @@ HARDWARE_PRESETS: dict[str, HardwareSpec] = {
         nvlink_domain_size=8,
         scaleout_bytes_per_s_per_gpu_per_direction=None,
         moe_backend="FlashInfer MXFP4 W4A8",
+        moe_a2a_backend=None,
+        sp_moe=False,
+        dp_lm_head=False,
+        kv_cache_bytes_per_element=2.0,
+        kda_state_bytes_per_element=4.0,
         mla_prefill_backend="TRT-LLM MHA path (cold prefill)",
         mla_decode_backend="TRT-LLM absorbed MLA",
         prefill_chunk_size=16384,
@@ -465,6 +564,8 @@ HARDWARE_PRESETS: dict[str, HardwareSpec] = {
         node_count=2,
         gpus_per_node=4,
         tp_size=8,
+        attention_tp_size=8,
+        attention_dp_size=1,
         ep_size=1,
         moe_sharding="tp",
         # Vendor-nameplate capacity, not an exact NVML/CUDA allocatable byte count.
@@ -478,6 +579,11 @@ HARDWARE_PRESETS: dict[str, HardwareSpec] = {
         nvlink_domain_size=72,
         scaleout_bytes_per_s_per_gpu_per_direction=None,
         moe_backend="FlashInfer MXFP4 W4A8",
+        moe_a2a_backend=None,
+        sp_moe=False,
+        dp_lm_head=False,
+        kv_cache_bytes_per_element=2.0,
+        kda_state_bytes_per_element=4.0,
         mla_prefill_backend="TRT-LLM MHA path (cold prefill)",
         mla_decode_backend="TRT-LLM absorbed MLA",
         prefill_chunk_size=16384,
@@ -509,6 +615,7 @@ HARDWARE_PRESETS["h200-tpep32"] = replace(
     gpu_count=32,
     node_count=4,
     tp_size=32,
+    attention_tp_size=32,
     ep_size=32,
     recipe_status=(
         "configured from SGLang's H200 high-throughput TP32+EP32 recipe; "
@@ -535,7 +642,7 @@ for _hardware in HARDWARE_PRESETS.values():
 
 
 CALCULATOR_HARDWARE_FAMILIES = ("h200", "b300", "gb300")
-CALCULATOR_TP_SIZES = (8, 16, 32, 64)
+CALCULATOR_TP_SIZES = (8, 16, 32)
 
 
 def make_tp_hardware(family: str, tp_size: int) -> HardwareSpec:
@@ -600,8 +707,13 @@ def make_tp_hardware(family: str, tp_size: int) -> HardwareSpec:
         node_count=nodes,
         gpus_per_node=gpus_per_node,
         tp_size=tp_size,
+        attention_tp_size=tp_size,
+        attention_dp_size=1,
         ep_size=1,
         moe_sharding="tp",
+        moe_a2a_backend=None,
+        sp_moe=False,
+        dp_lm_head=False,
         scaleout_bytes_per_s_per_gpu_per_direction=scaleout,
         kda_fused_decode_capable=(tp_size == 8),
         # The current K3 multicast/custom-AR and GEMM-AR kernels are TP8-only.
@@ -619,8 +731,154 @@ def make_tp_hardware(family: str, tp_size: int) -> HardwareSpec:
     return spec
 
 
-def make_calculator_hardware(family: str, tp_size: int) -> HardwareSpec:
-    """Returns the recipe-backed topology selected by the public calculator."""
+def make_ep_hardware(family: str, tp_size: int) -> HardwareSpec:
+    """Build a matched TP+EP topology using its family-specific recipe."""
+
+    if family not in CALCULATOR_HARDWARE_FAMILIES:
+        valid = ", ".join(CALCULATOR_HARDWARE_FAMILIES)
+        raise ValueError(f"Unknown hardware family {family!r}; choose from {valid}.")
+    if tp_size not in CALCULATOR_TP_SIZES:
+        valid = ", ".join(str(size) for size in CALCULATOR_TP_SIZES)
+        raise ValueError(f"TP+EP size must be one of: {valid}.")
+    if family in ("b300", "gb300"):
+        template = make_tp_hardware(family, tp_size)
+        attention_dp_size = tp_size // 8
+        if tp_size == 8:
+            recipe_status = (
+                "public SGLang live-generator TP8+EP8 scenario; omitted from "
+                "the rendered 16-64 GPU table; final serving verification in "
+                "progress and calculator performance remains analytical"
+            )
+        else:
+            recipe_status = (
+                "SGLang Blackwell Peak Throughput recipe; final serving "
+                "verification in progress"
+            )
+        fabric_warning = (
+            "B300 EP traffic above eight ranks crosses the assumed 100 GB/s "
+            "per-GPU, one-direction scale-out fabric; this is not a measured "
+            "MegaMoE result."
+            if family == "b300" and tp_size > 8
+            else (
+                "All selected GB300 ranks must share one healthy NVL72 L1 "
+                "NVLink domain; otherwise this communication model is invalid."
+                if family == "gb300"
+                else "TP8+EP8 remains inside one eight-GPU B300 NVLink domain."
+            )
+        )
+        spec = replace(
+            template,
+            id=f"{family}-tpep{tp_size}",
+            label=f"{family.upper()} TP{tp_size}+EP{tp_size}",
+            attention_tp_size=8,
+            attention_dp_size=attention_dp_size,
+            ep_size=tp_size,
+            moe_sharding="ep",
+            moe_backend="DeepGEMM MegaMoE MXFP4 W4A8",
+            moe_a2a_backend="MegaMoE",
+            sp_moe=True,
+            dp_lm_head=attention_dp_size > 1,
+            kv_cache_bytes_per_element=1.0,
+            kda_state_bytes_per_element=2.0,
+            kda_fused_decode_capable=True,
+            k3_fused_all_reduce_capable=False,
+            recipe_status=recipe_status,
+            sources=(
+                *template.sources,
+                _SGLANG_K3_RECIPE_SOURCE,
+                _SGLANG_K3_EXECUTION_SOURCE,
+            ),
+            derivations=(
+                *template.derivations,
+                f"Global TP{tp_size}/EP{tp_size} decomposes into attention TP8 "
+                f"x DP{attention_dp_size}.",
+                "EP A2A uses MegaMoE/DeepGEMM; SP-MoE and the TP1 shared-expert "
+                "overlap engage automatically.",
+                "The recipe stores MLA KV in FP8 e4m3 and KDA/Mamba state in BF16.",
+            ),
+            warnings=(
+                "This is a conditional analytical lower bound, not a calibrated "
+                "MegaMoE latency prediction.",
+                "Routing uses a fractional uniform-destination scenario; locality "
+                "or skew can redistribute fabric demand. MegaMoE alignment/padding, "
+                "control metadata, fabric contention, and collective startup are "
+                "excluded positive terms.",
+                "DeepGEMM symmetric buffers and transformed-weight workspace are "
+                "not included in accounted peak memory.",
+                "Assumes public default SGLANG_K3_SP_ATTN_RES=0; enabling "
+                "cross-layer shard carry changes the collective DAG and is "
+                "outside this scenario.",
+                fabric_warning,
+            ),
+        )
+        spec.validate()
+        return spec
+
+    h200_ep_recipes = {
+        16: "h200-tpep16",
+        32: "h200-tpep32",
+    }
+    preset_id = h200_ep_recipes.get(tp_size)
+    if preset_id is not None:
+        return HARDWARE_PRESETS[preset_id]
+
+    template = HARDWARE_PRESETS["h200-tpep16"]
+    spec = replace(
+        template,
+        id="h200-tpep8",
+        label="H200 1x8 TP8+EP8",
+        gpu_count=8,
+        node_count=1,
+        tp_size=8,
+        attention_tp_size=8,
+        ep_size=8,
+        scaleout_bytes_per_s_per_gpu_per_direction=None,
+        kda_fused_decode_capable=True,
+        recipe_status=(
+            "calculator H200 TP8+EP8 analytical topology; not a verified "
+            "deployment recipe"
+        ),
+        derivations=(
+            *(
+                derivation
+                for derivation in template.derivations
+                if derivation != _H200_NDR400_DERIVATION
+            ),
+            "TP8+EP8 stays within one eight-GPU NVLink domain; no scale-out "
+            "fabric is traversed.",
+            "TP8+EP8 places 112 complete routed experts on each of eight ranks.",
+        ),
+        warnings=(
+            "No published Kimi-K3 H200 deployment recipe uses TP8+EP8.",
+            "No MoE A2A backend is selected: tokens are replicated, experts are "
+            "local, and latent/shared outputs are reduced.",
+            "The 141 GB HBM value is a vendor-nameplate capacity; "
+            "runtime-reported and allocatable bytes can differ.",
+        ),
+    )
+    spec.validate()
+    return spec
+
+
+def make_calculator_hardware(
+    family: str,
+    tp_size: int,
+    moe_sharding: MoeSharding | None = None,
+) -> HardwareSpec:
+    """Return an explicit calculator topology, preserving the legacy default.
+
+    New callers should always provide ``moe_sharding``. ``None`` retains the
+    original public API behavior where H200 TP16/TP32 implicitly selected the
+    corresponding EP recipe.
+    """
+
+    if moe_sharding == "tp":
+        return make_tp_hardware(family, tp_size)
+    if moe_sharding == "ep":
+        return make_ep_hardware(family, tp_size)
+    if moe_sharding is not None:
+        raise ValueError("moe_sharding must be 'tp' or 'ep'.")
+
     h200_ep_recipes = {
         16: "h200-tpep16",
         32: "h200-tpep32",
